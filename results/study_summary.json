@@ -1,0 +1,48 @@
+{
+  "config": {
+    "model_name": "Qwen/Qwen2.5-3B-Instruct",
+    "num_false_belief_tasks": 20,
+    "num_true_belief_tasks": 20,
+    "batch_size": 4,
+    "max_new_tokens": 3,
+    "run_attention_analysis": true,
+    "attention_sample_size": 40,
+    "run_interventions": true,
+    "top_k_heads": 5,
+    "boost_scale": 2.0,
+    "results_dir": "results",
+    "tasks_file": "tasks.json"
+  },
+  "timestamp": "2026-01-30T21:53:31.987316",
+  "behavioral_accuracy": 0.9475,
+  "false_belief_accuracy": 0.895,
+  "true_belief_accuracy": 1.0,
+  "num_tasks": 400,
+  "attention_analyzed": true,
+  "num_patterns": 23040,
+  "top_tom_heads": [
+    [
+      0,
+      12
+    ],
+    [
+      0,
+      2
+    ],
+    [
+      23,
+      8
+    ],
+    [
+      24,
+      9
+    ],
+    [
+      14,
+      13
+    ]
+  ],
+  "interventions_run": true,
+  "ablation_accuracy_delta": -0.03749999999999998,
+  "boost_accuracy_delta": 0.015000000000000013
+}
