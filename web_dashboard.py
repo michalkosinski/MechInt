@@ -2106,18 +2106,31 @@ def parse_response(raw: str, prompt: str) -> str:
     Parse model response to extract the predicted container.
 
     NOTE: After each behavioral analysis run, review errors and improve this parsing.
-    Common patterns to handle:
-    - "1st" / "1st place" / "1st," → first container from preamble
-    - "box. What" / "suitcase. Where" → strip trailing punctuation/words
-    - "chest first," → strip "first,"
-    - "box or the" → strip "or the"
-    - "backpack if he" → strip "if he/she"
-    - Repeated prompt text → extract container after last "the "
+
+    Returns "[UNCERTAIN]" for hedging responses that should be marked wrong:
+    - "box or the" → model hedging between options
+    - "2 places" / "both" → model says both locations
+    - "then" → model suggests checking multiple places
+
+    Returns "[INVALID]" for garbage responses.
     """
     if not raw or raw == "-":
         return "-"
 
     raw = raw.strip()
+    lower = raw.lower()
+
+    # Detect UNCERTAIN responses (model hedging/doesn't know)
+    if " or " in lower and "the" in lower.split(" or ")[-1]:
+        return "[UNCERTAIN: or]"
+    if "2 place" in lower or "2 location" in lower or "both" in lower:
+        return "[UNCERTAIN: both]"
+    if ", then" in lower:
+        return "[UNCERTAIN: then]"
+
+    # Detect INVALID/garbage responses
+    if "____" in raw or "brainly" in lower or raw.startswith("-") or ". (" in raw:
+        return "[INVALID]"
 
     # Extract containers from prompt preamble: "There is a X and a Y."
     containers = []
@@ -2128,27 +2141,54 @@ def parse_response(raw: str, prompt: str) -> str:
             containers = [match.group(1), match.group(2)]
 
     # Handle ordinal references (1st, 2nd, first, second)
-    lower = raw.lower()
     if containers:
         if lower.startswith("1st") or lower.startswith("first"):
             return containers[0]
         if lower.startswith("2nd") or lower.startswith("second"):
             return containers[1]
 
-    # Handle repeated prompt text - extract after last "the "
-    if "will look for" in raw:
-        parts = raw.split("the ")
-        if parts:
+    # Handle repeated prompt text - extract after last "the " or "in the "
+    if "will look for" in raw or "for the" in raw:
+        if " in the " in raw:
+            parts = raw.split(" in the ")
+            raw = parts[-1]
+        elif "the " in raw:
+            parts = raw.split("the ")
             raw = parts[-1]
 
-    # Strip common suffixes
-    for suffix in [". What", ". Where", " first,", " or the", " if he", " if she",
-                   ". How", ". Why", ",", "."]:
-        if raw.endswith(suffix) or (suffix in raw):
+    # Handle trailing "1st," or "1st" after extraction
+    if containers and raw.strip().lower() in ["1st,", "1st"]:
+        return containers[0]
+
+    # Strip common suffixes (order matters - longer patterns first)
+    suffixes = [
+        " first,", " or the",
+        " if he", " if she", " if it",
+        ". What", ". Where", ". How", ". Why", ". If",
+        ".\nTo", ",", "."
+    ]
+    for suffix in suffixes:
+        if suffix in raw:
             raw = raw.split(suffix)[0]
 
-    # Clean up
-    raw = raw.strip(" .,;:!?")
+    # Clean up leading "the " and whitespace
+    raw = raw.strip(" .,;:!?\n")
+    if raw.lower().startswith("the "):
+        raw = raw[4:].strip()
+
+    # Handle "1st X" where X is a container name (e.g., "1st box" → "box")
+    if containers and raw.lower().startswith("1st "):
+        word_after = raw[4:].strip().lower()
+        for c in containers:
+            if word_after == c or word_after.startswith(c):
+                return c
+        return containers[0]  # Default to first container
+
+    # Handle plurals: "cupboards" → "cupboard"
+    if raw.endswith("s") and len(raw) > 3:
+        raw_singular = raw[:-1]
+        if containers and raw_singular.lower() in [c.lower() for c in containers]:
+            raw = raw_singular
 
     return raw if raw else "-"
 
