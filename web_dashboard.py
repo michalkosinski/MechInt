@@ -2101,8 +2101,60 @@ def render_interventions() -> str:
     return render_page("Interventions", content, "Interventions")
 
 
+def parse_response(raw: str, prompt: str) -> str:
+    """
+    Parse model response to extract the predicted container.
+
+    NOTE: After each behavioral analysis run, review errors and improve this parsing.
+    Common patterns to handle:
+    - "1st" / "1st place" / "1st," → first container from preamble
+    - "box. What" / "suitcase. Where" → strip trailing punctuation/words
+    - "chest first," → strip "first,"
+    - "box or the" → strip "or the"
+    - "backpack if he" → strip "if he/she"
+    - Repeated prompt text → extract container after last "the "
+    """
+    if not raw or raw == "-":
+        return "-"
+
+    raw = raw.strip()
+
+    # Extract containers from prompt preamble: "There is a X and a Y."
+    containers = []
+    if "There is" in prompt:
+        import re
+        match = re.search(r"There is an? (\w+) and an? (\w+)\.", prompt)
+        if match:
+            containers = [match.group(1), match.group(2)]
+
+    # Handle ordinal references (1st, 2nd, first, second)
+    lower = raw.lower()
+    if containers:
+        if lower.startswith("1st") or lower.startswith("first"):
+            return containers[0]
+        if lower.startswith("2nd") or lower.startswith("second"):
+            return containers[1]
+
+    # Handle repeated prompt text - extract after last "the "
+    if "will look for" in raw:
+        parts = raw.split("the ")
+        if parts:
+            raw = parts[-1]
+
+    # Strip common suffixes
+    for suffix in [". What", ". Where", " first,", " or the", " if he", " if she",
+                   ". How", ". Why", ",", "."]:
+        if raw.endswith(suffix) or (suffix in raw):
+            raw = raw.split(suffix)[0]
+
+    # Clean up
+    raw = raw.strip(" .,;:!?")
+
+    return raw if raw else "-"
+
+
 def render_tasks() -> str:
-    """Render the tasks page."""
+    """Render the tasks page with sorting, filtering, and parsed responses."""
     tasks = dashboard.get_tasks()
     behavioral = dashboard.get_behavioral_results()
 
@@ -2121,51 +2173,272 @@ def render_tasks() -> str:
         for detail in b.get("details", []):
             results_by_id[detail["task_id"]] = detail
 
+    # Sort tasks by ID (natural sort)
+    import re
+    def sort_key(t):
+        task_id = t.get("task_id", "")
+        # Extract prefix, number, and suffix (e.g., "tb_1r" -> ("tb", 1, "r"))
+        match = re.match(r"([a-z]+)_(\d+)(r?)", task_id)
+        if match:
+            return (match.group(1), int(match.group(2)), match.group(3))
+        return (task_id, 0, "")
+
+    tasks = sorted(tasks, key=sort_key)
+
     rows = []
-    for task in tasks:
+    for idx, task in enumerate(tasks):
         task_id = task.get("task_id", "")
         task_type = task.get("task_type", "")
+        prompt = task.get("full_prompt", "")
+        expected = task.get("expected_answer", "")
         result = results_by_id.get(task_id, {})
 
         if result:
             correct = result.get("correct", False)
-            badge = f'<span class="badge {"success" if correct else "error"}">{"Correct" if correct else "Wrong"}</span>'
-            response = html_module.escape(result.get("response", "N/A"))
+            raw = result.get("response", "N/A")
+            parsed = parse_response(raw, prompt)
+            # Re-evaluate correctness based on parsed response
+            parsed_correct = parsed.lower() == expected.lower()
+            badge = f'<span class="badge {"success" if parsed_correct else "error"}">{"✓" if parsed_correct else "✗"}</span>'
         else:
-            badge = '<span class="badge info">Not run</span>'
-            response = "-"
+            raw = "-"
+            parsed = "-"
+            badge = '<span class="badge info">-</span>'
 
-        type_badge = f'<span class="badge {"error" if task_type == "false_belief" else "info"}">{task_type.replace("_", " ").title()}</span>'
+        # Type badge with color coding
+        type_colors = {
+            "true_belief": "success",
+            "false_belief": "error",
+            "mismatch": "warning",
+            "negation_trap": "info",
+            "belief_overwrite": "purple"
+        }
+        base_type = task_type.replace("_reversed", "")
+        color = type_colors.get(base_type, "info")
+        type_short = task_type.replace("_reversed", " ↔").replace("_", " ").title()
+        type_badge = f'<span class="badge {color}">{type_short}</span>'
+
+        # Escape for HTML
+        raw_escaped = html_module.escape(raw)
+        parsed_escaped = html_module.escape(parsed)
+        prompt_escaped = html_module.escape(prompt)
+        expected_escaped = html_module.escape(expected)
 
         rows.append(f"""
-            <tr>
-                <td>{task_id}</td>
-                <td>{type_badge}</td>
-                <td><code>{html_module.escape(task.get('full_prompt', ''))}</code></td>
-                <td>{task.get('expected_answer', '')}</td>
-                <td>{response}</td>
-                <td>{badge}</td>
+            <tr data-type="{base_type}" data-correct="{str(result.get('correct', '')).lower()}" data-id="{task_id}">
+                <td class="col-id">{task_id}</td>
+                <td class="col-type">{type_badge}</td>
+                <td class="col-prompt"><code title="{prompt_escaped}">{prompt_escaped[:80]}{'...' if len(prompt) > 80 else ''}</code></td>
+                <td class="col-expected">{expected_escaped}</td>
+                <td class="col-raw"><code>{raw_escaped}</code></td>
+                <td class="col-parsed"><strong>{parsed_escaped}</strong></td>
+                <td class="col-result">{badge}</td>
+                <td class="col-expand">
+                    <button class="btn-expand" onclick="toggleDetails({idx})">▶</button>
+                </td>
+            </tr>
+            <tr class="details-row" id="details-{idx}" style="display:none;">
+                <td colspan="8">
+                    <div class="details-content">
+                        <div class="detail-section">
+                            <strong>Full Prompt:</strong>
+                            <pre>{prompt_escaped}</pre>
+                        </div>
+                        <div class="detail-section">
+                            <strong>Full Response (raw):</strong>
+                            <pre>{raw_escaped}</pre>
+                        </div>
+                        <div class="detail-section">
+                            <strong>Expected:</strong> {expected_escaped} |
+                            <strong>Parsed:</strong> {parsed_escaped} |
+                            <strong>Match:</strong> {parsed.lower() == expected.lower()}
+                        </div>
+                    </div>
+                </td>
             </tr>
         """)
 
-    content = f"""
-        <h1>Tasks ({len(tasks)})</h1>
+    # Count stats
+    total = len(tasks)
+    correct_count = sum(1 for t in tasks if results_by_id.get(t.get("task_id", {}), {}).get("correct", False))
 
-        <table>
+    content = f"""
+        <h1>Tasks ({total})</h1>
+
+        <div class="filters" style="margin-bottom: 1rem; display: flex; gap: 1rem; flex-wrap: wrap;">
+            <div>
+                <label>Type: </label>
+                <select id="filter-type" onchange="filterTasks()">
+                    <option value="">All</option>
+                    <option value="true_belief">True Belief</option>
+                    <option value="false_belief">False Belief</option>
+                    <option value="mismatch">Mismatch</option>
+                    <option value="negation_trap">Negation Trap</option>
+                    <option value="belief_overwrite">Belief Overwrite</option>
+                </select>
+            </div>
+            <div>
+                <label>Result: </label>
+                <select id="filter-result" onchange="filterTasks()">
+                    <option value="">All</option>
+                    <option value="true">Correct</option>
+                    <option value="false">Wrong</option>
+                </select>
+            </div>
+            <div>
+                <label>Search: </label>
+                <input type="text" id="filter-search" placeholder="Search prompts..." onkeyup="filterTasks()" style="width: 200px;">
+            </div>
+        </div>
+
+        <table id="tasks-table">
             <thead>
                 <tr>
-                    <th>ID</th>
-                    <th>Type</th>
+                    <th class="sortable" onclick="sortTable(0)">ID ▼</th>
+                    <th class="sortable" onclick="sortTable(1)">Type</th>
                     <th>Prompt</th>
-                    <th>Expected</th>
-                    <th>Response</th>
-                    <th>Result</th>
+                    <th class="sortable" onclick="sortTable(3)">Expected</th>
+                    <th>Raw</th>
+                    <th>Parsed</th>
+                    <th class="sortable" onclick="sortTable(6)">Result</th>
+                    <th></th>
                 </tr>
             </thead>
             <tbody>
                 {''.join(rows)}
             </tbody>
         </table>
+
+        <style>
+            .filters select, .filters input {{
+                padding: 0.3rem 0.5rem;
+                border: 1px solid var(--border);
+                border-radius: 4px;
+                background: var(--card);
+            }}
+            .sortable {{ cursor: pointer; }}
+            .sortable:hover {{ background: var(--hover); }}
+            .btn-expand {{
+                background: none;
+                border: none;
+                cursor: pointer;
+                font-size: 0.8rem;
+                padding: 0.2rem 0.5rem;
+            }}
+            .details-row td {{
+                background: var(--hover);
+                padding: 1rem;
+            }}
+            .details-content {{
+                display: flex;
+                flex-direction: column;
+                gap: 0.5rem;
+            }}
+            .detail-section pre {{
+                background: var(--card);
+                padding: 0.5rem;
+                border-radius: 4px;
+                white-space: pre-wrap;
+                word-break: break-word;
+                margin: 0.25rem 0;
+            }}
+            .col-id {{ width: 60px; }}
+            .col-type {{ width: 120px; }}
+            .col-expected, .col-parsed {{ width: 80px; }}
+            .col-raw {{ max-width: 150px; overflow: hidden; text-overflow: ellipsis; }}
+            .col-result {{ width: 50px; text-align: center; }}
+            .col-expand {{ width: 30px; }}
+            .badge.warning {{ background: #f59e0b; color: white; }}
+            .badge.purple {{ background: #8b5cf6; color: white; }}
+        </style>
+
+        <script>
+            let sortCol = 0;
+            let sortAsc = true;
+
+            function toggleDetails(idx) {{
+                const row = document.getElementById('details-' + idx);
+                const btn = row.previousElementSibling.querySelector('.btn-expand');
+                if (row.style.display === 'none') {{
+                    row.style.display = 'table-row';
+                    btn.textContent = '▼';
+                }} else {{
+                    row.style.display = 'none';
+                    btn.textContent = '▶';
+                }}
+            }}
+
+            function filterTasks() {{
+                const typeFilter = document.getElementById('filter-type').value;
+                const resultFilter = document.getElementById('filter-result').value;
+                const searchFilter = document.getElementById('filter-search').value.toLowerCase();
+
+                const rows = document.querySelectorAll('#tasks-table tbody tr:not(.details-row)');
+                rows.forEach(row => {{
+                    const type = row.dataset.type;
+                    const correct = row.dataset.correct;
+                    const prompt = row.querySelector('.col-prompt code').textContent.toLowerCase();
+
+                    let show = true;
+                    if (typeFilter && type !== typeFilter) show = false;
+                    if (resultFilter && correct !== resultFilter) show = false;
+                    if (searchFilter && !prompt.includes(searchFilter)) show = false;
+
+                    row.style.display = show ? '' : 'none';
+                    // Also hide details row
+                    const detailsRow = row.nextElementSibling;
+                    if (detailsRow && detailsRow.classList.contains('details-row')) {{
+                        detailsRow.style.display = 'none';
+                        row.querySelector('.btn-expand').textContent = '▶';
+                    }}
+                }});
+            }}
+
+            function sortTable(col) {{
+                const table = document.getElementById('tasks-table');
+                const tbody = table.querySelector('tbody');
+                const rows = Array.from(tbody.querySelectorAll('tr:not(.details-row)'));
+
+                if (col === sortCol) {{
+                    sortAsc = !sortAsc;
+                }} else {{
+                    sortCol = col;
+                    sortAsc = true;
+                }}
+
+                rows.sort((a, b) => {{
+                    let aVal = a.cells[col].textContent.trim();
+                    let bVal = b.cells[col].textContent.trim();
+
+                    // Natural sort for IDs
+                    if (col === 0) {{
+                        const parseId = (id) => {{
+                            const match = id.match(/([a-z]+)_(\\d+)(r?)/);
+                            if (match) return [match[1], parseInt(match[2]), match[3]];
+                            return [id, 0, ''];
+                        }};
+                        const [aPrefix, aNum, aSuffix] = parseId(aVal);
+                        const [bPrefix, bNum, bSuffix] = parseId(bVal);
+                        if (aPrefix !== bPrefix) return aPrefix.localeCompare(bPrefix);
+                        if (aNum !== bNum) return aNum - bNum;
+                        return aSuffix.localeCompare(bSuffix);
+                    }}
+
+                    return aVal.localeCompare(bVal);
+                }});
+
+                if (!sortAsc) rows.reverse();
+
+                // Re-append rows with their detail rows
+                rows.forEach(row => {{
+                    const detailsRow = document.getElementById('details-' + row.rowIndex);
+                    tbody.appendChild(row);
+                    if (row.nextElementSibling && row.nextElementSibling.classList.contains('details-row')) {{
+                        tbody.appendChild(row.nextElementSibling);
+                    }}
+                }});
+            }}
+        </script>
     """
 
     return render_page("Tasks", content, "Tasks")

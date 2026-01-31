@@ -1,223 +1,159 @@
 """
-Task generator for Theory of Mind false-belief experiments.
+Task generator for Theory of Mind experiments.
 
-Generates explicit belief statement tasks:
-- False belief: "A ball is in the blue box. Anna believes the ball is in the red box."
-- True belief: "A ball is in the blue box. Anna believes the ball is in the blue box."
+5 task types (each with reversed variant = 10 total):
+- true_belief: belief matches reality
+- false_belief: belief ≠ reality
+- mismatch: belief ≠ reality (opposite direction)
+- negation_trap: "believes not in X"
+- belief_overwrite: belief updated mid-story
 """
 
 import json
 import random
+from collections import Counter
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import List, Literal, Optional
 
-# Default vocabularies
 OBJECTS = [
     "ball", "key", "book", "apple", "toy", "coin", "letter", "phone",
-    "watch", "ring", "pen", "cup", "doll", "card", "hat", "scarf"
+    "watch", "ring", "pen", "cup", "doll", "card", "hat", "scarf",
+    "wallet", "photo", "ticket", "cookie", "orange", "banana", "marble",
+    "bracelet", "glove", "sock", "ribbon", "feather", "shell", "button",
+    "crayon", "sticker", "candy", "chocolate", "sandwich", "notebook"
 ]
 
 CONTAINERS = [
-    "red box", "blue box", "green basket", "wooden drawer",
-    "canvas bag", "metal cupboard", "yellow bucket", "white container"
+    "box", "basket", "drawer", "cupboard", "bag", "bucket", "chest",
+    "jar", "tin", "suitcase", "backpack", "crate", "bin", "trunk", "case"
 ]
 
 NAMES = [
     "Anna", "Bob", "Charlie", "Diana", "Eve", "Frank", "Grace", "Henry",
-    "Iris", "Jack", "Kate", "Leo", "Mia", "Noah", "Olivia", "Paul"
+    "Iris", "Jack", "Kate", "Leo", "Mia", "Noah", "Olivia", "Paul",
+    "Quinn", "Ryan", "Sara", "Tom", "Uma", "Victor", "Wendy", "Xander",
+    "Yuki", "Zoe", "Alex", "Beth", "Chris", "Dana", "Emma", "Felix"
 ]
+
+BASE_TYPES = ["true_belief", "false_belief", "mismatch", "negation_trap", "belief_overwrite"]
+PREFIXES = {"true_belief": "tb", "false_belief": "fb", "mismatch": "mm", "negation_trap": "nt", "belief_overwrite": "bo"}
+
+
+def article(word: str) -> str:
+    return "an" if word[0].lower() in "aeiou" else "a"
 
 
 @dataclass
 class ToMTask:
-    """A Theory of Mind task with explicit belief statement."""
     task_id: str
-    task_type: Literal["false_belief", "true_belief"]
-    story: str                    # "A ball is in the blue box."
-    belief_statement: str         # "Anna believes the ball is in the red box."
-    question: str                 # "Where will Anna look for the ball?"
-    full_prompt: str              # Complete prompt for the model
-    expected_answer: str          # "red box" or "blue box"
-    reality_location: str         # The actual location
-    belief_location: str          # What protagonist believes
-    protagonist_name: str         # "Anna"
-    object_name: str              # "ball"
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "ToMTask":
-        return cls(**d)
+    task_type: str
+    full_prompt: str
+    expected_answer: str
+    reality_location: str
+    belief_location: str
+    protagonist: str
+    obj: str
 
 
-def get_article(word: str) -> str:
-    """Return 'an' if word starts with a vowel sound, otherwise 'a'."""
-    return "an" if word[0].lower() in "aeiou" else "a"
+def generate_task(task_id: str, task_type: str, name: str, obj: str, c1: str, c2: str) -> ToMTask:
+    """Generate a single ToM task."""
+    base = task_type.replace("_reversed", "")
+    loc_a, loc_b = (c2, c1) if "_reversed" in task_type else (c1, c2)
 
+    preamble = f"There is {article(c1)} {c1} and {article(c2)} {c2}."
+    question = f"{name} will look for the {obj} in the "
 
-def generate_single_task(
-    task_id: str,
-    task_type: Literal["false_belief", "true_belief"],
-    protagonist: str,
-    obj: str,
-    location1: str,
-    location2: str,
-) -> ToMTask:
-    """
-    Generate a single ToM task.
-
-    For false belief: protagonist believes object is in location2, but it's in location1.
-    For true belief: protagonist correctly believes object is in location1.
-    """
-    reality_location = location1
-
-    if task_type == "false_belief":
-        belief_location = location2
+    # Task-specific logic
+    if base == "true_belief":
+        reality, belief = loc_b, loc_b
+    elif base == "false_belief":
+        reality, belief = loc_a, loc_b
+    elif base == "mismatch":
+        reality, belief = loc_b, loc_a
+    elif base == "negation_trap":
+        reality, belief = loc_b, loc_a
+    elif base == "belief_overwrite":
+        reality, belief = loc_a, loc_b
     else:
-        belief_location = location1
+        raise ValueError(f"Unknown task type: {task_type}")
 
-    article = get_article(obj)
-    story = f"{article.capitalize()} {obj} is in the {reality_location}."
-    belief_statement = f"{protagonist} believes the {obj} is in the {belief_location}."
-    # Use completion format for faster inference (only need 3 tokens)
-    question = f"{protagonist} will look for the {obj} in the"
+    # Build belief statement
+    if base == "negation_trap":
+        belief_stmt = f"{name} believes the {obj} is not in the {reality}."
+    elif base == "belief_overwrite":
+        belief_stmt = f"{name} believes the {obj} is in the {reality}. {name} now believes the {obj} is in the {belief}."
+    else:
+        belief_stmt = f"{name} believes the {obj} is in the {belief}."
 
-    full_prompt = f"{story} {belief_statement} {question}"
+    story = f"{article(obj).capitalize()} {obj} is in the {reality}."
+    full_prompt = f"{preamble} {story} {belief_stmt} {question}"
 
     return ToMTask(
         task_id=task_id,
         task_type=task_type,
-        story=story,
-        belief_statement=belief_statement,
-        question=question,
         full_prompt=full_prompt,
-        expected_answer=belief_location,
-        reality_location=reality_location,
-        belief_location=belief_location,
-        protagonist_name=protagonist,
-        object_name=obj,
+        expected_answer=belief,
+        reality_location=reality,
+        belief_location=belief,
+        protagonist=name,
+        obj=obj,
     )
 
 
-def generate_tasks(
-    num_false_belief: int = 20,
-    num_true_belief: int = 20,
-    objects: Optional[List[str]] = None,
-    containers: Optional[List[str]] = None,
-    names: Optional[List[str]] = None,
-    seed: Optional[int] = 42,
-) -> List[ToMTask]:
-    """
-    Generate a set of ToM tasks.
-
-    Args:
-        num_false_belief: Number of false belief tasks to generate
-        num_true_belief: Number of true belief tasks to generate
-        objects: List of objects to use (default: OBJECTS)
-        containers: List of containers to use (default: CONTAINERS)
-        names: List of protagonist names to use (default: NAMES)
-        seed: Random seed for reproducibility
-
-    Returns:
-        List of ToMTask instances
-    """
-    if seed is not None:
-        random.seed(seed)
-
-    objects = objects or OBJECTS
-    containers = containers or CONTAINERS
-    names = names or NAMES
-
+def generate_tasks(num_per_type: int = 10, seed: int = 42) -> list[ToMTask]:
+    """Generate tasks for all 10 task types (5 base + 5 reversed)."""
+    random.seed(seed)
     tasks = []
+    all_types = BASE_TYPES + [f"{t}_reversed" for t in BASE_TYPES]
 
-    # Generate false belief tasks
-    for i in range(num_false_belief):
-        protagonist = random.choice(names)
-        obj = random.choice(objects)
-        loc1, loc2 = random.sample(containers, 2)
+    for task_type in all_types:
+        base = task_type.replace("_reversed", "")
+        prefix = PREFIXES[base]
+        suffix = "r" if "_reversed" in task_type else ""
+        for i in range(num_per_type):
+            c1, c2 = random.sample(CONTAINERS, 2)
+            tasks.append(generate_task(
+                task_id=f"{prefix}_{i+1}{suffix}",
+                task_type=task_type,
+                name=random.choice(NAMES),
+                obj=random.choice(OBJECTS),
+                c1=c1,
+                c2=c2,
+            ))
 
-        task = generate_single_task(
-            task_id=f"fb_{i:03d}",
-            task_type="false_belief",
-            protagonist=protagonist,
-            obj=obj,
-            location1=loc1,
-            location2=loc2,
-        )
-        tasks.append(task)
-
-    # Generate true belief tasks
-    for i in range(num_true_belief):
-        protagonist = random.choice(names)
-        obj = random.choice(objects)
-        loc1 = random.choice(containers)
-        # For true belief, we still pick loc2 for variety but don't use it
-        loc2 = random.choice([c for c in containers if c != loc1])
-
-        task = generate_single_task(
-            task_id=f"tb_{i:03d}",
-            task_type="true_belief",
-            protagonist=protagonist,
-            obj=obj,
-            location1=loc1,
-            location2=loc2,
-        )
-        tasks.append(task)
-
-    # Shuffle tasks
     random.shuffle(tasks)
-
     return tasks
 
 
-def save_tasks(tasks: List[ToMTask], path: Path) -> None:
-    """Save tasks to a JSON file."""
-    path = Path(path)
-    data = {
-        "version": "1.0",
-        "num_tasks": len(tasks),
-        "num_false_belief": sum(1 for t in tasks if t.task_type == "false_belief"),
-        "num_true_belief": sum(1 for t in tasks if t.task_type == "true_belief"),
-        "tasks": [t.to_dict() for t in tasks],
-    }
-    path.write_text(json.dumps(data, indent=2))
+def save_tasks(tasks: list[ToMTask], path: Path) -> None:
+    counts = Counter(t.task_type for t in tasks)
+    data = {"version": "2.0", "num_tasks": len(tasks), "task_type_counts": dict(counts), "tasks": [asdict(t) for t in tasks]}
+    Path(path).write_text(json.dumps(data, indent=2))
 
 
-def load_tasks(path: Path) -> List[ToMTask]:
-    """Load tasks from a JSON file."""
-    path = Path(path)
-    data = json.loads(path.read_text())
-    return [ToMTask.from_dict(t) for t in data["tasks"]]
-
-
-def get_task_by_id(tasks: List[ToMTask], task_id: str) -> Optional[ToMTask]:
-    """Find a task by its ID."""
-    for task in tasks:
-        if task.task_id == task_id:
-            return task
-    return None
+def load_tasks(path: Path) -> list[ToMTask]:
+    data = json.loads(Path(path).read_text())
+    return [ToMTask(**t) for t in data["tasks"]]
 
 
 if __name__ == "__main__":
-    # Generate and save default tasks
-    tasks = generate_tasks(num_false_belief=20, num_true_belief=20)
+    tasks = generate_tasks(num_per_type=10)
     output_path = Path(__file__).parent.parent / "tasks.json"
     save_tasks(tasks, output_path)
 
+    counts = Counter(t.task_type for t in tasks)
     print(f"Generated {len(tasks)} tasks")
-    print(f"  False belief: {sum(1 for t in tasks if t.task_type == 'false_belief')}")
-    print(f"  True belief: {sum(1 for t in tasks if t.task_type == 'true_belief')}")
-    print(f"Saved to: {output_path}")
+    for t, c in sorted(counts.items()):
+        print(f"  {t}: {c}")
 
-    # Show example tasks
-    print("\nExample false belief task:")
-    fb_task = next(t for t in tasks if t.task_type == "false_belief")
-    print(f"  Prompt: {fb_task.full_prompt}")
-    print(f"  Expected: {fb_task.expected_answer}")
+    print(f"\nSaved to: {output_path}")
+    print("\n" + "="*60 + "\nEXAMPLES\n" + "="*60)
 
-    print("\nExample true belief task:")
-    tb_task = next(t for t in tasks if t.task_type == "true_belief")
-    print(f"  Prompt: {tb_task.full_prompt}")
-    print(f"  Expected: {tb_task.expected_answer}")
+    shown = set()
+    for task in tasks:
+        base = task.task_type.replace("_reversed", "")
+        if base not in shown:
+            shown.add(base)
+            print(f"\n--- {task.task_type.upper()} ---")
+            print(task.full_prompt)
+            print(f"Answer: {task.expected_answer}")

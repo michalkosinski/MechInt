@@ -80,3 +80,15 @@ Question: "Where will Anna look for the ball?"
 A head is "ToM-relevant" if:
 1. In false belief condition: `attention_to_belief / attention_to_reality > 1.5`
 2. Significant difference between false and true belief conditions
+
+## Post-Run Checklist
+
+**After each behavioral analysis run:**
+
+1. Review errors at `http://127.0.0.1:8016/tasks` (filter by "Wrong")
+2. Check if parsing can be improved in `parse_response()` in `web_dashboard.py`
+3. Common patterns to handle:
+   - Ordinal references: "1st", "2nd", "first place" → map to container order from preamble
+   - Trailing text: "box. What", "suitcase if he" → strip suffixes
+   - Repeated prompts: extract container after last "the "
+4. Re-run behavioral analysis after parsing improvements to get accurate metrics
