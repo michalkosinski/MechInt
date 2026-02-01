@@ -13,7 +13,7 @@ Behavioral study investigating Theory of Mind (ToM) in LLMs. Tests whether model
 pip install -r requirements.txt
 
 # Run behavioral study
-python -m src.run_study --behavioral-only
+python -m src.run_study
 
 # Run with specific model
 python -m src.run_study --model "Qwen/Qwen2.5-3B-Instruct"
