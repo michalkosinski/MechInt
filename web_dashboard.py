@@ -66,7 +66,7 @@ class Dashboard:
         self.model = model
         # If a model is specified, try model-specific subdirectory first
         if model:
-            # Convert model name to safe directory name (e.g., "Qwen/Qwen2.5-3B-Instruct" -> "Qwen--Qwen2.5-3B-Instruct")
+            # Convert model name to safe directory name (e.g., "Qwen/Qwen2.5-3B" -> "Qwen--Qwen2.5-3B")
             safe_model_name = model.replace("/", "--")
             model_dir = self.base_results_dir / safe_model_name
             # Fall back to base directory if model-specific directory doesn't exist
@@ -92,7 +92,7 @@ class Dashboard:
             for f in behavioral_dir.glob("*.json"):
                 # If a model is specified, only load matching files
                 if self.model:
-                    # Model name in filename: "Qwen/Qwen2.5-3B-Instruct" -> "Qwen_Qwen2.5-3B-Instruct"
+                    # Model name in filename: "Qwen/Qwen2.5-3B" -> "Qwen_Qwen2.5-3B"
                     expected_filename = self.model.replace("/", "_") + ".json"
                     if f.name != expected_filename:
                         continue
@@ -107,6 +107,21 @@ class Dashboard:
             data = json.loads(TASKS_FILE.read_text())
             return data.get("tasks", [])
         return []
+
+    def get_probing_results(self) -> Optional[Dict]:
+        """Load probing results for the selected model (if available)."""
+        probing_dir = self.results_dir / "probing"
+        if self.model:
+            model_dir = probing_dir / self.model.replace("/", "_")
+            metrics_path = model_dir / "probe_metrics.json"
+            if metrics_path.exists():
+                return json.loads(metrics_path.read_text())
+            return None
+
+        if probing_dir.exists():
+            for metrics_path in probing_dir.glob("*/probe_metrics.json"):
+                return json.loads(metrics_path.read_text())
+        return None
 
 
 # Global dashboard instance (will be recreated per-request with model)
@@ -126,6 +141,7 @@ def render_page(title: str, content: str, nav_active: str = "", selected_model: 
     nav_items = [
         ("Overview", "/"),
         ("Tasks", "/tasks"),
+        ("Probing", "/probing"),
     ]
 
     nav_html = "\n".join([
@@ -135,23 +151,23 @@ def render_page(title: str, content: str, nav_active: str = "", selected_model: 
 
     # Build model selector dropdown
     models = get_model_list()
-    model_options = ""
-    for model in models:
-        # Get short display name (last part after /)
-        display_name = model.split("/")[-1] if "/" in model else model
-        selected = "selected" if model == selected_model else ""
-        model_options += f'<option value="{html_module.escape(model)}" {selected}>{html_module.escape(display_name)}</option>'
-
-    # Add "None" option if no model is selected and models exist
-    none_selected = "selected" if not selected_model else ""
-
     model_selector = ""
     if models:
+        # If no model selected, default to first model
+        if not selected_model:
+            selected_model = models[0]
+
+        model_options = ""
+        for model in models:
+            # Get short display name (last part after /)
+            display_name = model.split("/")[-1] if "/" in model else model
+            selected = "selected" if model == selected_model else ""
+            model_options += f'<option value="{html_module.escape(model)}" {selected}>{html_module.escape(display_name)}</option>'
+
         model_selector = f'''
             <div class="model-selector">
                 <label for="model-select">Model:</label>
                 <select id="model-select" onchange="switchModel(this.value)">
-                    <option value="" {none_selected}>Default</option>
                     {model_options}
                 </select>
             </div>
@@ -377,6 +393,17 @@ def render_page(title: str, content: str, nav_active: str = "", selected_model: 
             text-align: center;
             padding: 4rem;
             color: var(--text-secondary);
+        }}
+
+        .empty-state .debug-info {{
+            margin-top: 1.5rem;
+            text-align: left;
+            display: inline-block;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            padding: 1rem 1.25rem;
+            border-radius: 10px;
+            font-size: 0.875rem;
         }}
 
         .empty-state svg {{
@@ -874,6 +901,557 @@ def render_tasks(selected_model: Optional[str] = None) -> str:
     return render_page("Tasks", content, "Tasks", selected_model=selected_model)
 
 
+def _accuracy_color(acc: float) -> str:
+    """Generate color for accuracy value (0-1 scale)."""
+    acc = max(0.0, min(1.0, acc))
+    # Blue (low) -> Cyan (mid) -> Green (high)
+    hue = 200 + (120 * acc)
+    light = 18 + (30 * acc)
+    return f"hsl({hue:.0f}, 70%, {light:.0f}%)"
+
+
+def _delta_color(delta: float) -> str:
+    """Generate color class for delta value."""
+    if delta > 5:
+        return "success"
+    elif delta < -5:
+        return "error"
+    return "warning"
+
+
+# Probe label explanations
+PROBE_EXPLANATIONS = {
+    "false_belief": {
+        "title": "False Belief Detection",
+        "question": "Can we decode WHETHER the protagonist has a false belief?",
+        "description": "Tests if hidden states encode that the protagonist's belief differs from reality.",
+        "labels": "0 = true belief (belief = reality), 1 = false belief (belief ≠ reality)",
+    },
+}
+
+
+def render_probing(selected_model: Optional[str] = None) -> str:
+    """Render probing analysis page with detailed explanations."""
+    probing_dashboard = get_dashboard(selected_model)
+    probing = probing_dashboard.get_probing_results()
+
+    if not probing:
+        probing_dir = RESULTS_DIR / "probing"
+        available_probe_models = []
+        if probing_dir.exists():
+            for metrics_path in probing_dir.glob("*/probe_metrics.json"):
+                available_probe_models.append(metrics_path.parent.name)
+        available_probe_models.sort()
+        expected_metrics_path = "N/A"
+        if selected_model:
+            expected_metrics_path = str(Path("results") / "probing" / selected_model.replace("/", "_") / "probe_metrics.json")
+        available_models_display = ", ".join(available_probe_models) if available_probe_models else "None found"
+        expected_metrics_path_html = html_module.escape(expected_metrics_path)
+        available_models_html = html_module.escape(available_models_display)
+
+        return render_page("Probing", f"""
+            <h1>Probing Analysis</h1>
+            <div class="empty-state">
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+                </svg>
+                <p>No probing results found.</p>
+                <p>Run <code>python -m src.probing_analysis</code> to generate probing results.</p>
+                <div class="debug-info">
+                    <p><strong>Expected metrics path for selected model:</strong> <code>{expected_metrics_path_html}</code></p>
+                    <p><strong>Available probe models:</strong> {available_models_html}</p>
+                </div>
+            </div>
+        """, "Probing", selected_model=selected_model)
+
+    model_name = probing.get("model_name", selected_model or "Unknown")
+    timestamp = probing.get("timestamp", "N/A")
+    config = probing.get("config", {})
+    results = probing.get("results", {})
+    timing = probing.get("timing", {})
+    feature_position = probing.get("feature_position", "prompt_end")
+
+    # Build configuration display
+    config_html = f"""
+        <div class="config-panel">
+            <h3>Analysis Configuration</h3>
+            <div class="config-grid">
+                <div class="config-item">
+                    <span class="config-label">Families</span>
+                    <span class="config-value">{config.get('num_families', 'N/A')}</span>
+                </div>
+                <div class="config-item">
+                    <span class="config-label">Tasks</span>
+                    <span class="config-value">{config.get('num_families', 0) * 8}</span>
+                </div>
+                <div class="config-item">
+                    <span class="config-label">CV Folds</span>
+                    <span class="config-value">{config.get('n_folds', 'N/A')}</span>
+                </div>
+                <div class="config-item">
+                    <span class="config-label">Seed</span>
+                    <span class="config-value">{config.get('seed', 'N/A')}</span>
+                </div>
+                <div class="config-item">
+                    <span class="config-label">Feature</span>
+                    <span class="config-value">{feature_position}</span>
+                </div>
+                <div class="config-item">
+                    <span class="config-label">Normalization</span>
+                    <span class="config-value">{'Yes' if config.get('normalize', True) else 'No'}</span>
+                </div>
+                <div class="config-item">
+                    <span class="config-label">Filter Correct</span>
+                    <span class="config-value">{'Yes' if config.get('filter_correct', False) else 'No'}</span>
+                </div>
+                <div class="config-item">
+                    <span class="config-label">Cache</span>
+                    <span class="config-value">{timing.get('cache_status', 'N/A')}</span>
+                </div>
+                <div class="config-item">
+                    <span class="config-label">Hidden States (ms)</span>
+                    <span class="config-value">{timing.get('hidden_state_time_ms', 0.0):.0f}</span>
+                </div>
+                <div class="config-item">
+                    <span class="config-label">Cache Load (ms)</span>
+                    <span class="config-value">{timing.get('cache_load_time_ms', 0.0):.0f}</span>
+                </div>
+                <div class="config-item">
+                    <span class="config-label">Probe Train (ms)</span>
+                    <span class="config-value">{timing.get('probe_train_time_ms', 0.0):.0f}</span>
+                </div>
+            </div>
+        </div>
+    """
+
+    # Build sections for each probe type
+    sections = []
+
+    for label_type, label_data in results.items():
+        explanation = PROBE_EXPLANATIONS.get(label_type, {})
+        metrics = label_data.get("metrics", [])
+        if not metrics:
+            continue
+
+        # Calculate stats
+        best_layer = label_data.get("best_layer", 0)
+        best_acc = label_data.get("best_accuracy", 0) * 100
+
+        best_random = 50.0
+        best_auc = 0.5
+        for m in metrics:
+            if m.get("layer") == best_layer:
+                best_auc = m.get("auc", 0.5)
+                break
+
+        delta = best_acc - best_random
+        delta_class = _delta_color(delta)
+
+        # Build accuracy chart (CSS bars)
+        chart_bars = []
+        max_acc = max(m.get("accuracy", 0) for m in metrics) if metrics else 1.0
+        max_acc = max(max_acc, 0.6)  # Ensure reasonable scale
+
+        for m in metrics:
+            acc = m.get("accuracy", 0)
+            rand = 0.5
+            layer = m.get("layer", 0)
+            height_acc = (acc / max_acc) * 100
+            height_rand = (rand / max_acc) * 100
+
+            chart_bars.append(f"""
+                <div class="chart-bar-group" title="Layer {layer}: {acc*100:.1f}% (random: {rand*100:.1f}%)">
+                    <div class="chart-bar chart-bar-acc" style="height: {height_acc}%;"></div>
+                    <div class="chart-bar chart-bar-rand" style="height: {height_rand}%;"></div>
+                    <span class="chart-label">{layer}</span>
+                </div>
+            """)
+
+        # Build metrics table rows
+        table_rows = []
+        for m in metrics:
+            acc = m.get("accuracy", 0) * 100
+            rand = 50.0
+            row_delta = acc - rand
+            row_class = _delta_color(row_delta)
+
+            table_rows.append(f"""
+                <tr class="{'highlight-row' if m.get('layer') == best_layer else ''}">
+                    <td>{m.get('layer')}</td>
+                    <td><strong>{acc:.1f}%</strong></td>
+                    <td>{m.get('auc', 0):.3f}</td>
+                    <td>{m.get('f1', 0):.3f}</td>
+                    <td>{m.get('brier', 0):.3f}</td>
+                    <td>{rand:.1f}%</td>
+                    <td class="{row_class}">{row_delta:+.1f}%</td>
+                </tr>
+            """)
+
+        # Heatmap cells
+        heatmap_cells = []
+        for m in metrics:
+            acc = m.get("accuracy", 0)
+            heatmap_cells.append(
+                f"<div class='heatmap-cell' title='Layer {m.get('layer')}: {acc*100:.1f}%' "
+                f"style='background: {_accuracy_color(acc)}'>{m.get('layer')}</div>"
+            )
+
+        sections.append(f"""
+            <div class="probe-section">
+                <div class="probe-header">
+                    <h2>{explanation.get('title', label_type)}</h2>
+                    <p class="probe-question">{explanation.get('question', '')}</p>
+                </div>
+
+                <div class="probe-explanation">
+                    <p>{explanation.get('description', '')}</p>
+                    <p class="probe-labels"><strong>Labels:</strong> {explanation.get('labels', '')}</p>
+                </div>
+
+                <div class="position-description">
+                    <strong>Feature:</strong> {feature_position}
+                </div>
+
+                <div class="card-grid" style="grid-template-columns: repeat(4, 1fr);">
+                    <div class="card">
+                        <h3>Best Layer</h3>
+                        <div class="value">{best_layer}</div>
+                        <div class="subtext">of {len(metrics) - 1} layers</div>
+                    </div>
+                    <div class="card">
+                        <h3>Best Accuracy</h3>
+                        <div class="value">{best_acc:.1f}%</div>
+                        <div class="subtext">50% = chance</div>
+                    </div>
+                    <div class="card">
+                        <h3>vs Random</h3>
+                        <div class="value {delta_class}">{delta:+.1f}%</div>
+                        <div class="subtext">baseline: {best_random:.1f}%</div>
+                    </div>
+                    <div class="card">
+                        <h3>Best AUC</h3>
+                        <div class="value">{best_auc:.3f}</div>
+                        <div class="subtext">0.5 = random</div>
+                    </div>
+                </div>
+
+                <div class="chart-container">
+                    <h4>Accuracy by Layer</h4>
+                    <div class="chart-legend">
+                        <span class="legend-item"><span class="legend-color acc"></span> Probe Accuracy</span>
+                        <span class="legend-item"><span class="legend-color rand"></span> Random Baseline</span>
+                    </div>
+                    <div class="bar-chart">
+                        {''.join(chart_bars)}
+                    </div>
+                </div>
+
+                <div class="heatmap-container">
+                    <h4>Layer Heatmap</h4>
+                    <div class="heatmap" style="grid-template-columns: repeat({len(metrics)}, 24px);">
+                        {''.join(heatmap_cells)}
+                    </div>
+                    <div class="legend">
+                        <span>50%</span>
+                        <div class="legend-gradient"></div>
+                        <span>100%</span>
+                    </div>
+                </div>
+
+                <details class="metrics-details">
+                    <summary>Full Metrics Table</summary>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Layer</th>
+                                <th title="Percentage of test samples correctly classified">Accuracy</th>
+                                <th title="Area Under ROC Curve - ranking quality (0.5=random, 1.0=perfect)">AUC</th>
+                                <th title="F1 Score - harmonic mean of precision and recall">F1</th>
+                                <th title="Brier Score - mean squared error of probabilities (lower=better)">Brier</th>
+                                <th title="Accuracy with random labels">Random</th>
+                                <th title="Accuracy minus random baseline">Delta</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {''.join(table_rows)}
+                        </tbody>
+                    </table>
+                </details>
+            </div>
+        """)
+
+    # Probing-specific styles
+    probing_styles = """
+        <style>
+            .intro-box {
+                background: var(--bg-secondary);
+                border: 1px solid var(--border);
+                border-radius: 12px;
+                padding: 1.5rem;
+                margin-bottom: 2rem;
+            }
+
+            .intro-box h3 {
+                color: var(--accent);
+                margin-bottom: 0.5rem;
+            }
+
+            .config-panel {
+                background: var(--bg-tertiary);
+                border-radius: 8px;
+                padding: 1rem 1.5rem;
+                margin-bottom: 2rem;
+            }
+
+            .config-panel h3 {
+                font-size: 0.875rem;
+                color: var(--text-secondary);
+                margin-bottom: 0.75rem;
+            }
+
+            .config-grid {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 1.5rem;
+            }
+
+            .config-item {
+                display: flex;
+                flex-direction: column;
+            }
+
+            .config-label {
+                font-size: 0.75rem;
+                color: var(--text-secondary);
+                text-transform: uppercase;
+            }
+
+            .config-value {
+                font-weight: 600;
+                color: var(--text-primary);
+            }
+
+            .probe-section {
+                background: var(--bg-secondary);
+                border: 1px solid var(--border);
+                border-radius: 12px;
+                padding: 1.5rem;
+                margin-bottom: 2rem;
+            }
+
+            .probe-header h2 {
+                margin-bottom: 0.25rem;
+            }
+
+            .probe-question {
+                color: var(--accent);
+                font-size: 1.1rem;
+                font-style: italic;
+            }
+
+            .probe-explanation {
+                background: var(--bg-tertiary);
+                border-radius: 8px;
+                padding: 1rem;
+                margin: 1rem 0;
+            }
+
+            .probe-labels {
+                font-size: 0.875rem;
+                color: var(--text-secondary);
+                margin-top: 0.5rem;
+            }
+
+            .position-tabs {
+                display: flex;
+                gap: 0.5rem;
+                margin-bottom: 1rem;
+                border-bottom: 1px solid var(--border);
+                padding-bottom: 0.5rem;
+            }
+
+            .position-tab {
+                background: transparent;
+                border: 1px solid var(--border);
+                border-radius: 8px;
+                padding: 0.5rem 1rem;
+                color: var(--text-secondary);
+                cursor: pointer;
+                transition: all 0.2s;
+            }
+
+            .position-tab:hover {
+                border-color: var(--accent);
+                color: var(--text-primary);
+            }
+
+            .position-tab.active {
+                background: var(--accent);
+                border-color: var(--accent);
+                color: white;
+            }
+
+            .position-content {
+                display: none;
+            }
+
+            .position-content.active {
+                display: block;
+            }
+
+            .position-description {
+                background: var(--bg-primary);
+                padding: 0.75rem 1rem;
+                border-radius: 6px;
+                margin-bottom: 1rem;
+                font-size: 0.875rem;
+                color: var(--text-secondary);
+            }
+
+            .chart-container {
+                background: var(--bg-tertiary);
+                border-radius: 8px;
+                padding: 1rem;
+                margin: 1rem 0;
+            }
+
+            .chart-container h4 {
+                margin-bottom: 0.5rem;
+                font-size: 0.875rem;
+                color: var(--text-secondary);
+            }
+
+            .chart-legend {
+                display: flex;
+                gap: 1.5rem;
+                margin-bottom: 0.75rem;
+                font-size: 0.75rem;
+            }
+
+            .legend-item {
+                display: flex;
+                align-items: center;
+                gap: 0.5rem;
+            }
+
+            .legend-color {
+                width: 12px;
+                height: 12px;
+                border-radius: 2px;
+            }
+
+            .legend-color.acc {
+                background: var(--accent);
+            }
+
+            .legend-color.rand {
+                background: var(--text-secondary);
+                opacity: 0.5;
+            }
+
+            .bar-chart {
+                display: flex;
+                align-items: flex-end;
+                height: 120px;
+                gap: 2px;
+                padding: 0.5rem 0;
+                border-bottom: 1px solid var(--border);
+            }
+
+            .chart-bar-group {
+                flex: 1;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                height: 100%;
+                position: relative;
+            }
+
+            .chart-bar {
+                width: 100%;
+                max-width: 20px;
+                position: absolute;
+                bottom: 16px;
+                border-radius: 2px 2px 0 0;
+            }
+
+            .chart-bar-acc {
+                background: var(--accent);
+                z-index: 2;
+            }
+
+            .chart-bar-rand {
+                background: var(--text-secondary);
+                opacity: 0.3;
+                z-index: 1;
+            }
+
+            .chart-label {
+                position: absolute;
+                bottom: 0;
+                font-size: 0.6rem;
+                color: var(--text-secondary);
+            }
+
+            .metrics-details {
+                margin-top: 1rem;
+            }
+
+            .metrics-details summary {
+                cursor: pointer;
+                color: var(--accent);
+                font-size: 0.875rem;
+                padding: 0.5rem 0;
+            }
+
+            .highlight-row {
+                background: rgba(29, 155, 240, 0.1);
+            }
+
+            .highlight-row td {
+                font-weight: 600;
+            }
+
+            th[title] {
+                cursor: help;
+                text-decoration: underline dotted;
+            }
+
+            .success { color: var(--success); }
+            .warning { color: var(--warning); }
+            .error { color: var(--error); }
+        </style>
+    """
+
+    probing_script = ""
+
+    content = f"""
+        {probing_styles}
+
+        <h1>Probing Analysis</h1>
+
+        <div class="intro-box">
+            <h3>What is Linear Probing?</h3>
+            <p>Linear probing tests whether a concept is encoded in a model's hidden states in a <strong>linearly accessible</strong> way.
+            A simple linear classifier is trained to predict labels from hidden states at specific token positions and layers.
+            If the probe achieves accuracy significantly above chance (50%), the model encodes that information.</p>
+        </div>
+
+        <p style="margin-bottom: 1rem;">
+            <strong>Model:</strong> {html_module.escape(model_name)} &nbsp;|&nbsp;
+            <strong>Timestamp:</strong> {html_module.escape(timestamp)}
+        </p>
+
+        {config_html}
+
+        {''.join(sections) if sections else '<p>No probing metrics found.</p>'}
+
+        {probing_script}
+    """
+
+    return render_page("Probing", content, "Probing", selected_model=selected_model)
+
+
 def render_api_stats(selected_model: Optional[str] = None) -> str:
     """Return JSON stats for API."""
     summary = dashboard.get_study_summary()
@@ -909,6 +1487,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             content_type = "text/html"
         elif path == "/tasks":
             content = render_tasks(selected_model)
+            content_type = "text/html"
+        elif path == "/probing":
+            content = render_probing(selected_model)
             content_type = "text/html"
         elif path == "/api/stats":
             content = render_api_stats(selected_model)

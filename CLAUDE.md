@@ -16,7 +16,7 @@ pip install -r requirements.txt
 python -m src.run_study
 
 # Run with specific model
-python -m src.run_study --model "Qwen/Qwen2.5-3B-Instruct"
+python -m src.run_study --model "Qwen/Qwen2.5-3B"
 
 # Start dashboard (port 8016)
 nohup python server_watchdog.py > /tmp/MechInt_watchdog.log 2>&1 &

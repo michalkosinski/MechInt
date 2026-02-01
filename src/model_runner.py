@@ -140,7 +140,7 @@ class ModelRunner:
     Runs HuggingFace models with attention extraction.
 
     Example:
-        runner = ModelRunner("Qwen/Qwen2.5-3B-Instruct")
+        runner = ModelRunner("mistralai/Mistral-7B-v0.3")
         output = runner.run_task(task, max_new_tokens=3, stop_strings=["."], extract_attention=True)
         print(output.model_response)
         print(output.attentions[0].shape)  # (1, num_heads, seq_len, seq_len)
@@ -148,7 +148,7 @@ class ModelRunner:
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen2.5-3B-Instruct",
+        model_name: str = "mistralai/Mistral-7B-v0.3",
         device: str = "auto",
         torch_dtype: torch.dtype = torch.bfloat16,
         max_memory: Optional[Dict[int, str]] = None,
@@ -508,6 +508,60 @@ class ModelRunner:
             total_output_tokens=total_output_tokens,
             tokens_per_second=speed_metrics.tokens_per_second,
         )
+
+    def iter_hidden_states(
+        self,
+        tasks: List[ToMTask],
+        batch_size: Optional[int] = None,
+    ):
+        """
+        Yield hidden states for each task without generation.
+
+        Yields:
+            Tuple of (task, input_ids, tokens, hidden_states, input_length)
+        """
+        if not tasks:
+            return
+
+        if batch_size is None:
+            if self.optimal_batch_size is None and self._auto_optimize:
+                self._optimize_and_save_batch_size(tasks)
+            batch_size = self.optimal_batch_size or 8
+
+        num_batches = (len(tasks) + batch_size - 1) // batch_size
+
+        for batch_idx in tqdm(range(num_batches), desc="Extracting hidden states"):
+            batch_start = batch_idx * batch_size
+            batch_end = min(batch_start + batch_size, len(tasks))
+            batch_tasks = tasks[batch_start:batch_end]
+
+            prompts = [task.full_prompt for task in batch_tasks]
+            inputs = self.tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+            ).to(self.model.device)
+
+            with torch.no_grad():
+                outputs = self.model(
+                    **inputs,
+                    output_hidden_states=True,
+                    use_cache=False,
+                    return_dict=True,
+                )
+
+            hidden_states = outputs.hidden_states
+
+            for i, task in enumerate(batch_tasks):
+                input_ids = inputs.input_ids[i]
+                non_pad_mask = input_ids != self.tokenizer.pad_token_id
+                input_length = int(non_pad_mask.sum().item())
+                tokens = self.tokenizer.convert_ids_to_tokens(input_ids)
+
+                per_task_hidden = tuple(layer[i].cpu() for layer in hidden_states)
+
+                yield task, input_ids.cpu(), tokens, per_task_hidden, input_length
 
     def _run_batch_internal(
         self,

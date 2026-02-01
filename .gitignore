@@ -14,13 +14,15 @@ ENV/
 *.swp
 *.swo
 
-# Project specific
-results/behavioral/*.json
-results/attention/*.pkl
-results/attention/*.npz
-results/interventions/*.json
+# Generated results
+results/
+
+# Generated tasks
+tasks.json
+tasks.md
 
 # Secrets
+.env
 .env.local
 
 # OS
@@ -30,3 +32,6 @@ Thumbs.db
 # Logs
 *.log
 /tmp/
+
+# Pytest
+.pytest_cache/

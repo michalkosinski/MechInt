@@ -20,20 +20,25 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-from .task_generator import ToMTask, generate_tasks, save_tasks, load_tasks
+from .task_generator import ToMTask, load_tasks
 from .model_runner import ModelRunner, ModelOutput, BatchOutput
+from .probing_analysis import ProbingConfig, run_probing_analysis
 
 
 @dataclass
 class StudyConfig:
     """Configuration for a MechInt study run."""
-    model_name: str = "Qwen/Qwen2.5-3B-Instruct"
+    model_name: str = "mistralai/Mistral-7B-v0.3"
     num_false_belief_tasks: int = 20
     num_true_belief_tasks: int = 20
     batch_size: int = 16
     max_new_tokens: int = 3
     results_dir: Path = Path("results")
     tasks_file: Path = Path("tasks.json")
+    run_probing: bool = False
+    probing_num_families: int = 100
+    probing_seed: int = 42
+    probing_filter_correct: bool = False
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -136,24 +141,30 @@ def run_study(config: StudyConfig) -> StudyResults:
     print("MechInt: Theory of Mind Behavioral Study")
     print("=" * 60)
     print(f"Model: {config.model_name}")
-    print(f"Tasks: {config.num_false_belief_tasks} false belief + {config.num_true_belief_tasks} true belief")
     print(f"Results dir: {config.results_dir}")
+
+    required_model = "mistralai/Mistral-7B-v0.3"
+    if config.model_name != required_model:
+        raise ValueError(
+            f"Study runs are restricted to {required_model}. "
+            f"Got: {config.model_name}"
+        )
 
     # Ensure directories exist
     config.results_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load or generate tasks
-    if config.tasks_file.exists():
-        print(f"\nLoading tasks from {config.tasks_file}")
-        tasks = load_tasks(config.tasks_file)
-    else:
-        print(f"\nGenerating {config.num_false_belief_tasks + config.num_true_belief_tasks} tasks...")
-        tasks = generate_tasks(
-            num_false_belief=config.num_false_belief_tasks,
-            num_true_belief=config.num_true_belief_tasks,
+    # Load tasks (do not generate new tasks here)
+    if not config.tasks_file.exists():
+        raise FileNotFoundError(
+            f"Tasks file not found: {config.tasks_file}. "
+            "Please provide an existing tasks.json."
         )
-        save_tasks(tasks, config.tasks_file)
-        print(f"Saved tasks to {config.tasks_file}")
+
+    print(f"\nLoading tasks from {config.tasks_file}")
+    tasks = load_tasks(config.tasks_file)
+    fb_count = sum(1 for t in tasks if t.task_type == "false_belief")
+    tb_count = sum(1 for t in tasks if t.task_type == "true_belief")
+    print(f"Tasks loaded: {fb_count} false belief + {tb_count} true belief ({len(tasks)} total)")
 
     # Load model
     runner = ModelRunner(config.model_name)
@@ -176,6 +187,21 @@ def run_study(config: StudyConfig) -> StudyResults:
         num_tasks=len(tasks),
     )
 
+    # Optional probing analysis
+    if config.run_probing:
+        probing_config = ProbingConfig(
+            num_families=config.probing_num_families,
+            seed=config.probing_seed,
+            filter_correct=config.probing_filter_correct,
+        )
+        run_probing_analysis(
+            runner,
+            tasks,
+            outputs=outputs,
+            results_dir=config.results_dir,
+            config=probing_config,
+        )
+
     # Save summary
     summary_path = config.results_dir / "study_summary.json"
     summary_path.write_text(json.dumps(results.to_dict(), indent=2))
@@ -195,7 +221,7 @@ def main():
     )
     parser.add_argument(
         "--model", "-m",
-        default=os.getenv("MODEL_NAME", "Qwen/Qwen2.5-3B-Instruct"),
+        default=os.getenv("MODEL_NAME", "mistralai/Mistral-7B-v0.3"),
         help="Model name (HuggingFace model ID)"
     )
     parser.add_argument(
@@ -226,7 +252,29 @@ def main():
         "--tasks-file", "-t",
         type=Path,
         default=Path("tasks.json"),
-        help="Path to tasks file (will be created if doesn't exist)"
+        help="Path to tasks file (must already exist)"
+    )
+    parser.add_argument(
+        "--run-probing",
+        action="store_true",
+        help="Run probing analysis (extracts hidden states)"
+    )
+    parser.add_argument(
+        "--probe-families",
+        type=int,
+        default=int(os.getenv("PROBE_FAMILIES", "100")),
+        help="Number of task families to use for probing"
+    )
+    parser.add_argument(
+        "--probe-seed",
+        type=int,
+        default=int(os.getenv("PROBE_SEED", "42")),
+        help="Random seed for probing family selection"
+    )
+    parser.add_argument(
+        "--probe-filter-correct",
+        action="store_true",
+        help="Use only behaviorally-correct tasks for probing"
     )
     # Keep --behavioral-only for backwards compatibility (now a no-op)
     parser.add_argument(
@@ -244,6 +292,10 @@ def main():
         batch_size=args.batch_size,
         results_dir=args.results_dir,
         tasks_file=args.tasks_file,
+        run_probing=args.run_probing,
+        probing_num_families=args.probe_families,
+        probing_seed=args.probe_seed,
+        probing_filter_correct=args.probe_filter_correct,
     )
 
     run_study(config)

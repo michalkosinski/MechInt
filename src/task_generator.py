@@ -106,7 +106,7 @@ def generate_family(family_id: str, agent: str, obj: str, c1: str, c2: str) -> l
     return [make_task(family_id, agent, obj, c1, c2, row) for row in ROWS]
 
 
-def generate_tasks(num_families: int = 10, seed: int = 42) -> list[ToMTask]:
+def generate_tasks(num_families: int = 100, seed: int = 42) -> list[ToMTask]:
     """Generate num_families × 8 tasks."""
     random.seed(seed)
     tasks = []
@@ -166,7 +166,7 @@ def load_tasks(path: Path) -> list[ToMTask]:
 
 
 if __name__ == "__main__":
-    tasks = generate_tasks(num_families=20)
+    tasks = generate_tasks()
     output_path = Path(__file__).parent.parent / "tasks.json"
     save_tasks(tasks, output_path)
 

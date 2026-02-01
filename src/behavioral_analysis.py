@@ -208,7 +208,7 @@ def save_results(results: List[dict], summary: dict, output_dir: Path) -> Path:
 def main():
     """Run behavioral analysis from command line."""
     parser = argparse.ArgumentParser(description="Run behavioral analysis on ToM tasks")
-    parser.add_argument("--model", "-m", default=os.getenv("MODEL_NAME", "Qwen/Qwen2.5-3B-Instruct"))
+    parser.add_argument("--model", "-m", default=os.getenv("MODEL_NAME", "Qwen/Qwen2.5-3B"))
     parser.add_argument("--tasks-file", "-t", type=Path, default=Path("tasks.json"))
     parser.add_argument("--output-dir", "-o", type=Path, default=Path("results"))
     parser.add_argument("--max-tokens", type=int, default=20)
