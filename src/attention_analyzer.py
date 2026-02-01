@@ -186,19 +186,19 @@ class AttentionAnalyzer:
         regions = {}
 
         # Find protagonist region
-        protagonist_lower = task.protagonist_name.lower()
+        protagonist_lower = task.protagonist.lower()
         regions["protagonist"] = self._find_region(
             tokens_lower, protagonist_lower, "protagonist"
         )
 
         # Find belief location region
-        belief_parts = task.belief_location.lower().split()
+        belief_parts = task.belief.lower().split()
         regions["belief_location"] = self._find_region(
             tokens_lower, belief_parts, "belief_location"
         )
 
         # Find reality location region (may overlap with belief in true-belief tasks)
-        reality_parts = task.reality_location.lower().split()
+        reality_parts = task.world.lower().split()
         regions["reality_location"] = self._find_region(
             tokens_lower, reality_parts, "reality_location"
         )

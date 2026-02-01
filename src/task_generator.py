@@ -1,32 +1,31 @@
+### DO NOT CHANGE THIS FILE WITHOUT HUMAN APPROVAL. ###
+### DO NOT CHANGE THIS FILE WITHOUT HUMAN APPROVAL. ###
+### DO NOT CHANGE THIS FILE WITHOUT HUMAN APPROVAL. ###
+
 """
 Task generator for Theory of Mind experiments.
 
-5 task types (each with reversed variant = 10 total):
-- true_belief: belief matches reality
-- false_belief: belief ≠ reality
-- mismatch: belief ≠ reality (opposite direction)
-- negation_trap: "believes not in X"
-- belief_overwrite: belief updated mid-story
+8-row truth table design per family (agent, obj, C1, C2):
+- order: (C1,C2) or (C2,C1) in preamble
+- world: C1 or C2 (where object actually is)
+- belief: C1 or C2 (where agent thinks it is)
+
+TB: world == belief (tb1-tb4)
+FB: world != belief (fb1-fb4)
 """
 
 import json
 import random
-from collections import Counter
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
 OBJECTS = [
-    "ball", "key", "book", "apple", "toy", "coin", "letter", "phone",
-    "watch", "ring", "pen", "cup", "doll", "card", "hat", "scarf",
-    "wallet", "photo", "ticket", "cookie", "orange", "banana", "marble",
-    "bracelet", "glove", "sock", "ribbon", "feather", "shell", "button",
-    "crayon", "sticker", "candy", "chocolate", "sandwich", "notebook"
+    "ring", "coin", "key", "ball", "card", "marble", "button", "chip",
+    "token", "disc", "cube", "peg", "bead", "badge", "tag", "toy",
+    "marker", "pin", "seal", "medal", "clip"
 ]
 
-CONTAINERS = [
-    "box", "basket", "drawer", "cupboard", "bag", "bucket", "chest",
-    "jar", "tin", "suitcase", "backpack", "crate", "bin", "trunk", "case"
-]
+CONTAINERS = ["box", "basket", "drawer", "cupboard", "bag"]
 
 NAMES = [
     "Anna", "Bob", "Charlie", "Diana", "Eve", "Frank", "Grace", "Henry",
@@ -35,8 +34,17 @@ NAMES = [
     "Yuki", "Zoe", "Alex", "Beth", "Chris", "Dana", "Emma", "Felix"
 ]
 
-BASE_TYPES = ["true_belief", "false_belief", "mismatch", "negation_trap", "belief_overwrite"]
-PREFIXES = {"true_belief": "tb", "false_belief": "fb", "mismatch": "mm", "negation_trap": "nt", "belief_overwrite": "bo"}
+# (suffix, order_idx, world_idx, belief_idx)
+ROWS = [
+    ("tb1", (1, 2), 1, 1),
+    ("tb2", (2, 1), 1, 1),
+    ("tb3", (1, 2), 2, 2),
+    ("tb4", (2, 1), 2, 2),
+    ("fb1", (1, 2), 1, 2),
+    ("fb2", (2, 1), 1, 2),
+    ("fb3", (1, 2), 2, 1),
+    ("fb4", (2, 1), 2, 1),
+]
 
 
 def article(word: str) -> str:
@@ -45,115 +53,125 @@ def article(word: str) -> str:
 
 @dataclass
 class ToMTask:
-    task_id: str
-    task_type: str
+    task_id: str                # e.g., "f001_tb3"
+    family_id: str              # e.g., "f001"
+    task_type: str              # "true_belief" or "false_belief"
     full_prompt: str
-    expected_answer: str
-    reality_location: str
-    belief_location: str
+    expected_answer: str        # always = belief
     protagonist: str
     obj: str
+    c1: str                     # canonical "first" container
+    c2: str                     # canonical "second" container
+    order: tuple[str, str]      # (first_mentioned, second_mentioned) in preamble
+    world: str                  # reality location
+    belief: str                 # belief location
 
 
-def generate_task(task_id: str, task_type: str, name: str, obj: str, c1: str, c2: str) -> ToMTask:
-    """Generate a single ToM task."""
-    base = task_type.replace("_reversed", "")
-    loc_a, loc_b = (c2, c1) if "_reversed" in task_type else (c1, c2)
+def make_task(family_id: str, agent: str, obj: str, c1: str, c2: str,
+              row_def: tuple) -> ToMTask:
+    """Create a single task from a row definition."""
+    suffix, order_idx, world_idx, belief_idx = row_def
+    containers = {1: c1, 2: c2}
 
-    preamble = f"There is {article(c1)} {c1} and {article(c2)} {c2}."
-    question = f"{name} will look for the {obj} in the "
+    order = (containers[order_idx[0]], containers[order_idx[1]])
+    world = containers[world_idx]
+    belief = containers[belief_idx]
+    task_type = "true_belief" if suffix.startswith("tb") else "false_belief"
 
-    # Task-specific logic
-    if base == "true_belief":
-        reality, belief = loc_b, loc_b
-    elif base == "false_belief":
-        reality, belief = loc_a, loc_b
-    elif base == "mismatch":
-        reality, belief = loc_b, loc_a
-    elif base == "negation_trap":
-        reality, belief = loc_b, loc_a
-    elif base == "belief_overwrite":
-        reality, belief = loc_a, loc_b
-    else:
-        raise ValueError(f"Unknown task type: {task_type}")
-
-    # Build belief statement
-    if base == "negation_trap":
-        belief_stmt = f"{name} believes the {obj} is not in the {reality}."
-    elif base == "belief_overwrite":
-        belief_stmt = f"{name} believes the {obj} is in the {reality}. {name} now believes the {obj} is in the {belief}."
-    else:
-        belief_stmt = f"{name} believes the {obj} is in the {belief}."
-
-    story = f"{article(obj).capitalize()} {obj} is in the {reality}."
-    full_prompt = f"{preamble} {story} {belief_stmt} {question}"
+    prompt = (
+        f"There is {article(order[0])} {order[0]} and {article(order[1])} {order[1]}. "
+        f"{article(obj).capitalize()} {obj} is in the {world}. "
+        f"{agent} believes the {obj} is in the {belief}. "
+        f"{agent} will look for the {obj} in the"
+    )
 
     return ToMTask(
-        task_id=task_id,
+        task_id=f"{family_id}_{suffix}",
+        family_id=family_id,
         task_type=task_type,
-        full_prompt=full_prompt,
+        full_prompt=prompt,
         expected_answer=belief,
-        reality_location=reality,
-        belief_location=belief,
-        protagonist=name,
+        protagonist=agent,
         obj=obj,
+        c1=c1,
+        c2=c2,
+        order=order,
+        world=world,
+        belief=belief,
     )
 
 
-def generate_tasks(num_per_type: int = 10, seed: int = 42) -> list[ToMTask]:
-    """Generate tasks for all 10 task types (5 base + 5 reversed)."""
+def generate_family(family_id: str, agent: str, obj: str, c1: str, c2: str) -> list[ToMTask]:
+    """Generate all 8 rows for one family."""
+    return [make_task(family_id, agent, obj, c1, c2, row) for row in ROWS]
+
+
+def generate_tasks(num_families: int = 10, seed: int = 42) -> list[ToMTask]:
+    """Generate num_families × 8 tasks."""
     random.seed(seed)
     tasks = []
-    all_types = BASE_TYPES + [f"{t}_reversed" for t in BASE_TYPES]
+    used: set[tuple[str, str, str, str]] = set()
 
-    for task_type in all_types:
-        base = task_type.replace("_reversed", "")
-        prefix = PREFIXES[base]
-        suffix = "r" if "_reversed" in task_type else ""
-        for i in range(num_per_type):
+    for i in range(num_families):
+        while True:
             c1, c2 = random.sample(CONTAINERS, 2)
-            tasks.append(generate_task(
-                task_id=f"{prefix}_{i+1}{suffix}",
-                task_type=task_type,
-                name=random.choice(NAMES),
-                obj=random.choice(OBJECTS),
-                c1=c1,
-                c2=c2,
-            ))
+            agent = random.choice(NAMES)
+            obj = random.choice(OBJECTS)
+            config = (agent, obj, c1, c2)
+            if config not in used:
+                used.add(config)
+                break
+
+        family_id = f"f{i + 1:03d}"
+        tasks.extend(generate_family(family_id, agent, obj, c1, c2))
 
     random.shuffle(tasks)
     return tasks
 
 
 def save_tasks(tasks: list[ToMTask], path: Path) -> None:
-    counts = Counter(t.task_type for t in tasks)
-    data = {"version": "2.0", "num_tasks": len(tasks), "task_type_counts": dict(counts), "tasks": [asdict(t) for t in tasks]}
+    """Save tasks to JSON and markdown files."""
+    families = {t.family_id for t in tasks}
+    tb_count = sum(1 for t in tasks if t.task_type == "true_belief")
+
+    data = {
+        "version": "6.0",
+        "num_tasks": len(tasks),
+        "num_families": len(families),
+        "task_type_counts": {"true_belief": tb_count, "false_belief": len(tasks) - tb_count},
+        "tasks": [asdict(t) for t in tasks],
+    }
+
     Path(path).write_text(json.dumps(data, indent=2))
+
+    # Save markdown
+    md_path = path.with_suffix(".md")
+    lines = [f"# ToM Tasks ({len(tasks)} total, {len(families)} families)\n"]
+    for i, task in enumerate(tasks, 1):
+        lines.append(
+            f"{i}. **{task.task_id}** ({task.task_type}): "
+            f"{task.full_prompt}**{task.expected_answer}**\n"
+        )
+    md_path.write_text("\n".join(lines))
 
 
 def load_tasks(path: Path) -> list[ToMTask]:
+    """Load tasks from JSON file."""
     data = json.loads(Path(path).read_text())
-    return [ToMTask(**t) for t in data["tasks"]]
+    tasks = []
+    for t in data["tasks"]:
+        t["order"] = tuple(t["order"])
+        tasks.append(ToMTask(**t))
+    return tasks
 
 
 if __name__ == "__main__":
-    tasks = generate_tasks(num_per_type=10)
+    tasks = generate_tasks(num_families=20)
     output_path = Path(__file__).parent.parent / "tasks.json"
     save_tasks(tasks, output_path)
 
-    counts = Counter(t.task_type for t in tasks)
-    print(f"Generated {len(tasks)} tasks")
-    for t, c in sorted(counts.items()):
-        print(f"  {t}: {c}")
-
-    print(f"\nSaved to: {output_path}")
-    print("\n" + "="*60 + "\nEXAMPLES\n" + "="*60)
-
-    shown = set()
-    for task in tasks:
-        base = task.task_type.replace("_reversed", "")
-        if base not in shown:
-            shown.add(base)
-            print(f"\n--- {task.task_type.upper()} ---")
-            print(task.full_prompt)
-            print(f"Answer: {task.expected_answer}")
+    tb = sum(1 for t in tasks if t.task_type == "true_belief")
+    fb = len(tasks) - tb
+    print(f"Generated {len(tasks)} tasks ({len(tasks)//8} families × 8)")
+    print(f"  Types: {tb} true_belief, {fb} false_belief")
+    print(f"\nSaved to: {output_path} and {output_path.with_suffix('.md')}")

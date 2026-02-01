@@ -5,8 +5,10 @@ Loads models with output_attentions=True and extracts attention weights
 for analysis of Theory of Mind processing.
 """
 
+import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -15,6 +17,47 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .task_generator import ToMTask
+
+
+# =============================================================================
+# Data Structures
+# =============================================================================
+
+@dataclass
+class SpeedMetrics:
+    """Detailed speed metrics for model execution."""
+    model_load_time_ms: float = 0.0
+    tokenization_time_ms: float = 0.0
+    generation_time_ms: float = 0.0
+    decoding_time_ms: float = 0.0
+    total_time_ms: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    tokens_per_second: float = 0.0
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class ModelConfig:
+    """Persisted configuration for a model."""
+    model_name: str
+    optimal_batch_size: int
+    num_layers: int
+    num_heads: int
+    hidden_size: int
+    device: str
+    dtype: str
+    last_optimized: str
+    optimization_device: str
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ModelConfig":
+        return cls(**data)
 
 
 @dataclass
@@ -26,12 +69,18 @@ class ModelOutput:
     model_response: str
     expected_answer: str
     is_correct: bool
-    # Attention tensors: tuple of (batch, num_heads, seq_len, seq_len) per layer
+    # Full text fields
+    full_input_text: str
+    full_output_text: str
+    raw_generated_text: str
+    # Speed metrics
+    speed_metrics: SpeedMetrics
+    input_token_count: int
+    output_token_count: int
+    # Attention data
     attentions: Optional[Tuple[torch.Tensor, ...]] = None
     input_ids: Optional[torch.Tensor] = None
     tokens: List[str] = field(default_factory=list)
-    logits: Optional[torch.Tensor] = None
-    generation_time_ms: float = 0.0
 
     def has_attentions(self) -> bool:
         return self.attentions is not None
@@ -44,7 +93,47 @@ class BatchOutput:
     total_time_ms: float
     correct_count: int
     accuracy: float
+    speed_metrics: SpeedMetrics
+    batch_size_used: int
+    total_input_tokens: int
+    total_output_tokens: int
+    tokens_per_second: float
 
+
+# =============================================================================
+# models.json Helpers
+# =============================================================================
+
+def load_models_config(path: Path = None) -> Dict[str, ModelConfig]:
+    """Load model configurations from models.json."""
+    if path is None:
+        path = Path(__file__).parent.parent / "models.json"
+
+    if not path.exists():
+        return {}
+
+    data = json.loads(path.read_text())
+    return {
+        name: ModelConfig.from_dict(config)
+        for name, config in data.get("models", {}).items()
+    }
+
+
+def save_models_config(configs: Dict[str, ModelConfig], path: Path = None) -> None:
+    """Save model configurations to models.json."""
+    if path is None:
+        path = Path(__file__).parent.parent / "models.json"
+
+    data = {
+        "version": "1.0",
+        "models": {name: config.to_dict() for name, config in configs.items()}
+    }
+    path.write_text(json.dumps(data, indent=2))
+
+
+# =============================================================================
+# Model Runner
+# =============================================================================
 
 class ModelRunner:
     """
@@ -52,7 +141,7 @@ class ModelRunner:
 
     Example:
         runner = ModelRunner("Qwen/Qwen2.5-3B-Instruct")
-        output = runner.run_task(task, extract_attention=True)
+        output = runner.run_task(task, max_new_tokens=3, stop_strings=["."], extract_attention=True)
         print(output.model_response)
         print(output.attentions[0].shape)  # (1, num_heads, seq_len, seq_len)
     """
@@ -63,6 +152,8 @@ class ModelRunner:
         device: str = "auto",
         torch_dtype: torch.dtype = torch.bfloat16,
         max_memory: Optional[Dict[int, str]] = None,
+        auto_optimize_batch_size: bool = True,
+        models_config_path: Optional[Path] = None,
     ):
         """
         Initialize the model runner.
@@ -72,12 +163,14 @@ class ModelRunner:
             device: Device to use ("auto", "cuda", "cpu", "mps")
             torch_dtype: Torch dtype for model weights
             max_memory: Optional memory constraints per device
+            auto_optimize_batch_size: Whether to auto-optimize batch size
+            models_config_path: Path to models.json (default: project root)
         """
         self.model_name = model_name
         self.device = device
         self.torch_dtype = torch_dtype
+        self._models_config_path = models_config_path or Path(__file__).parent.parent / "models.json"
 
-        print(f"Loading model: {model_name}")
         start = time.time()
 
         # Load tokenizer
@@ -87,39 +180,127 @@ class ModelRunner:
         )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.tokenizer.padding_side = "left"  # Important for batched generation
+        self.tokenizer.padding_side = "left"
 
         # Load model with attention output enabled
-        # IMPORTANT: Use attn_implementation="eager" to get attention weights
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            dtype=torch_dtype,
+            torch_dtype=torch_dtype,
             device_map=device,
             trust_remote_code=True,
-            attn_implementation="eager",  # Required for attention output
+            attn_implementation="eager",
             max_memory=max_memory,
         )
         self.model.eval()
 
-        # Get model config info
+        # Model config info
         self.num_layers = self.model.config.num_hidden_layers
         self.num_heads = self.model.config.num_attention_heads
+        self.hidden_size = self.model.config.hidden_size
 
-        load_time = time.time() - start
-        print(f"Model loaded in {load_time:.1f}s")
-        print(f"  Layers: {self.num_layers}, Heads: {self.num_heads}")
-        print(f"  Device: {next(self.model.parameters()).device}")
+        # Timing and device
+        self.load_time_ms = (time.time() - start) * 1000
+        self.actual_device = str(next(self.model.parameters()).device)
 
-    def _prepare_prompt(self, task: ToMTask) -> str:
-        """Prepare the prompt for a task."""
-        # For completion-style prompts (ending with "in the"), use direct completion
-        # Don't use chat template as it causes the model to reason instead of complete
-        return task.full_prompt
+        # Batch size optimization
+        self.optimal_batch_size: Optional[int] = None
+        self._auto_optimize = auto_optimize_batch_size
+        if auto_optimize_batch_size:
+            self._load_cached_batch_size()
+
+    def _load_cached_batch_size(self) -> None:
+        """Load cached batch size from models.json if available."""
+        configs = load_models_config(self._models_config_path)
+
+        if self.model_name in configs:
+            config = configs[self.model_name]
+            if config.optimization_device == self.actual_device:
+                self.optimal_batch_size = config.optimal_batch_size
+
+    def _try_batch_size(self, tasks: List[ToMTask], batch_size: int) -> Tuple[bool, float]:
+        """
+        Try running with a specific batch size.
+
+        Returns:
+            Tuple of (success, time_per_task_ms)
+        """
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        try:
+            start = time.time()
+            batch = tasks[:batch_size]
+            self._run_batch_internal(batch, max_new_tokens=3, stop_strings=["."], extract_attention=False)
+            elapsed = (time.time() - start) * 1000
+            return True, elapsed / batch_size
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return False, float('inf')
+            raise
+
+    def find_optimal_batch_size(
+        self,
+        sample_tasks: List[ToMTask],
+        min_batch: int = 1,
+        max_batch: int = 64,
+    ) -> int:
+        """
+        Find optimal batch size using binary search with OOM detection.
+
+        Args:
+            sample_tasks: Tasks to use for benchmarking
+            min_batch: Minimum batch size to try
+            max_batch: Maximum batch size to try
+
+        Returns:
+            Optimal batch size
+        """
+        if len(sample_tasks) < max_batch:
+            max_batch = len(sample_tasks)
+
+        optimal = min_batch
+        low, high = min_batch, max_batch
+
+        while low <= high:
+            mid = (low + high) // 2
+            success, _ = self._try_batch_size(sample_tasks, mid)
+
+            if success:
+                optimal = mid
+                low = mid + 1
+            else:
+                high = mid - 1
+
+        return optimal
+
+    def _optimize_and_save_batch_size(self, sample_tasks: List[ToMTask]) -> int:
+        """Run batch size optimization and save results."""
+        optimal = self.find_optimal_batch_size(sample_tasks)
+
+        configs = load_models_config(self._models_config_path)
+        configs[self.model_name] = ModelConfig(
+            model_name=self.model_name,
+            optimal_batch_size=optimal,
+            num_layers=self.num_layers,
+            num_heads=self.num_heads,
+            hidden_size=self.hidden_size,
+            device=self.actual_device,
+            dtype=str(self.torch_dtype),
+            last_optimized=datetime.now().isoformat(),
+            optimization_device=self.actual_device,
+        )
+        save_models_config(configs, self._models_config_path)
+
+        self.optimal_batch_size = optimal
+        return optimal
 
     def run_task(
         self,
         task: ToMTask,
-        max_new_tokens: int = 3,
+        max_new_tokens: int,
+        stop_strings: List[str],
         extract_attention: bool = True,
         temperature: float = 0.0,
     ) -> ModelOutput:
@@ -128,26 +309,30 @@ class ModelRunner:
 
         Args:
             task: The ToM task to run
-            max_new_tokens: Maximum tokens to generate (default 3 for completion format)
+            max_new_tokens: Maximum tokens to generate (required)
+            stop_strings: Strings that stop generation (required)
             extract_attention: Whether to extract attention weights
             temperature: Generation temperature (0 for greedy)
 
         Returns:
-            ModelOutput with response, correctness, and optionally attention
+            ModelOutput with response, correctness, timing, and optionally attention
         """
-        start_time = time.time()
+        total_start = time.time()
 
-        input_text = self._prepare_prompt(task)
+        # Tokenization
+        tokenize_start = time.time()
+        input_text = task.full_prompt
         inputs = self.tokenizer(
             input_text,
             return_tensors="pt",
             padding=True,
         ).to(self.model.device)
-
         input_length = inputs.input_ids.shape[1]
         tokens = self.tokenizer.convert_ids_to_tokens(inputs.input_ids[0])
+        tokenize_time_ms = (time.time() - tokenize_start) * 1000
 
-        # Generate with attention
+        # Generation
+        gen_start = time.time()
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
@@ -157,16 +342,27 @@ class ModelRunner:
                 do_sample=temperature > 0,
                 temperature=temperature if temperature > 0 else None,
                 pad_token_id=self.tokenizer.pad_token_id,
+                stop_strings=stop_strings,
+                tokenizer=self.tokenizer,
             )
+        gen_time_ms = (time.time() - gen_start) * 1000
 
-        # Decode response
-        generated_ids = outputs.sequences[0][input_length:]
-        response = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        # Decoding
+        decode_start = time.time()
+        full_output_ids = outputs.sequences[0]
+        generated_ids = full_output_ids[input_length:]
 
-        # Check correctness
-        is_correct = self._check_answer(response, task.expected_answer)
+        full_output_text = self.tokenizer.decode(full_output_ids, skip_special_tokens=True)
+        raw_generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        response = raw_generated_text.strip()
+        decode_time_ms = (time.time() - decode_start) * 1000
 
-        # Extract attention if requested
+        total_time_ms = (time.time() - total_start) * 1000
+
+        # Correctness
+        is_correct = task.expected_answer.lower() in response.lower()
+
+        # Attention extraction
         attentions = None
         if extract_attention and hasattr(outputs, "attentions") and outputs.attentions:
             if outputs.attentions[0] is not None:
@@ -174,7 +370,18 @@ class ModelRunner:
                     layer_attn.cpu() for layer_attn in outputs.attentions[0]
                 )
 
-        generation_time_ms = (time.time() - start_time) * 1000
+        # Speed metrics
+        output_token_count = len(generated_ids)
+        speed_metrics = SpeedMetrics(
+            model_load_time_ms=0.0,
+            tokenization_time_ms=tokenize_time_ms,
+            generation_time_ms=gen_time_ms,
+            decoding_time_ms=decode_time_ms,
+            total_time_ms=total_time_ms,
+            input_tokens=input_length,
+            output_tokens=output_token_count,
+            tokens_per_second=(input_length + output_token_count) / (total_time_ms / 1000) if total_time_ms > 0 else 0,
+        )
 
         return ModelOutput(
             task_id=task.task_id,
@@ -183,39 +390,57 @@ class ModelRunner:
             model_response=response,
             expected_answer=task.expected_answer,
             is_correct=is_correct,
+            full_input_text=input_text,
+            full_output_text=full_output_text,
+            raw_generated_text=raw_generated_text,
+            speed_metrics=speed_metrics,
+            input_token_count=input_length,
+            output_token_count=output_token_count,
             attentions=attentions,
             input_ids=inputs.input_ids.cpu(),
             tokens=tokens,
-            generation_time_ms=generation_time_ms,
         )
 
     def run_batch(
         self,
         tasks: List[ToMTask],
-        batch_size: int = 8,
-        max_new_tokens: int = 3,
+        max_new_tokens: int,
+        stop_strings: List[str],
+        batch_size: Optional[int] = None,
         extract_attention: bool = False,
         attention_sample_size: int = 20,
         on_progress: Optional[Callable[[int, int, ModelOutput], None]] = None,
+        temperature: float = 0.0,
     ) -> BatchOutput:
         """
         Run multiple tasks in batches for efficiency.
 
         Args:
             tasks: List of tasks to run
-            batch_size: Number of tasks to process together
-            max_new_tokens: Maximum tokens to generate per task (default 3)
-            extract_attention: Whether to extract attention (slows down processing)
-            attention_sample_size: If extract_attention is True, only extract for this many tasks
+            max_new_tokens: Maximum tokens to generate per task (required)
+            stop_strings: Stop generation when these strings are produced (required)
+            batch_size: Batch size (None = use optimal)
+            extract_attention: Whether to extract attention
+            attention_sample_size: Number of tasks to extract attention for
             on_progress: Callback for progress updates
+            temperature: Generation temperature (0 for greedy/deterministic)
 
         Returns:
             BatchOutput with all results and summary statistics
         """
         start_time = time.time()
-        outputs = []
 
-        # Decide which tasks get attention extraction (sample for efficiency)
+        # Determine batch size
+        if batch_size is None:
+            if self.optimal_batch_size is None and self._auto_optimize:
+                self._optimize_and_save_batch_size(tasks)
+            batch_size = self.optimal_batch_size or 8
+
+        outputs = []
+        total_input_tokens = 0
+        total_output_tokens = 0
+
+        # Attention sampling
         attention_task_ids = set()
         if extract_attention and attention_sample_size > 0:
             import random
@@ -233,23 +458,28 @@ class ModelRunner:
             batch_outputs = self._run_batch_internal(
                 batch_tasks,
                 max_new_tokens=max_new_tokens,
-                extract_attention=False,  # Don't extract in batch mode for speed
+                extract_attention=False,
+                stop_strings=stop_strings,
+                temperature=temperature,
             )
+
+            for output in batch_outputs:
+                total_input_tokens += output.input_token_count
+                total_output_tokens += output.output_token_count
+
             outputs.extend(batch_outputs)
 
             if on_progress:
                 on_progress(batch_end, len(tasks), batch_outputs[-1])
 
-        # Now extract attention for sampled tasks (one at a time)
+        # Extract attention for sampled tasks
         if attention_task_ids:
-            print(f"\nExtracting attention for {len(attention_task_ids)} sampled tasks...")
             task_lookup = {t.task_id: t for t in tasks}
             output_lookup = {o.task_id: o for o in outputs}
 
             for task_id in tqdm(attention_task_ids, desc="Extracting attention"):
                 task = task_lookup[task_id]
-                attn_output = self.run_task(task, max_new_tokens=max_new_tokens, extract_attention=True)
-                # Update the output with attention
+                attn_output = self.run_task(task, max_new_tokens=max_new_tokens, stop_strings=stop_strings, extract_attention=True)
                 orig_output = output_lookup[task_id]
                 orig_output.attentions = attn_output.attentions
                 orig_output.tokens = attn_output.tokens
@@ -259,18 +489,33 @@ class ModelRunner:
         correct_count = sum(1 for o in outputs if o.is_correct)
         accuracy = correct_count / len(outputs) if outputs else 0.0
 
+        speed_metrics = SpeedMetrics(
+            model_load_time_ms=self.load_time_ms,
+            total_time_ms=total_time_ms,
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens,
+            tokens_per_second=(total_input_tokens + total_output_tokens) / (total_time_ms / 1000) if total_time_ms > 0 else 0,
+        )
+
         return BatchOutput(
             outputs=outputs,
             total_time_ms=total_time_ms,
             correct_count=correct_count,
             accuracy=accuracy,
+            speed_metrics=speed_metrics,
+            batch_size_used=batch_size,
+            total_input_tokens=total_input_tokens,
+            total_output_tokens=total_output_tokens,
+            tokens_per_second=speed_metrics.tokens_per_second,
         )
 
     def _run_batch_internal(
         self,
         tasks: List[ToMTask],
-        max_new_tokens: int = 3,
+        max_new_tokens: int,
+        stop_strings: List[str],
         extract_attention: bool = False,
+        temperature: float = 0.0,
     ) -> List[ModelOutput]:
         """
         Internal method to run a batch of tasks together.
@@ -282,44 +527,67 @@ class ModelRunner:
 
         start_time = time.time()
 
-        # Prepare all prompts
-        prompts = [self._prepare_prompt(task) for task in tasks]
-
-        # Tokenize with padding
+        # Tokenization
+        tokenize_start = time.time()
+        prompts = [task.full_prompt for task in tasks]
         inputs = self.tokenizer(
             prompts,
             return_tensors="pt",
             padding=True,
             truncation=True,
         ).to(self.model.device)
+        tokenize_time_ms = (time.time() - tokenize_start) * 1000
 
-        # Generate
+        # Generation
+        gen_start = time.time()
         with torch.no_grad():
-            outputs = self.model.generate(
+            generate_kwargs = {
                 **inputs,
-                max_new_tokens=max_new_tokens,
-                output_attentions=extract_attention,
-                return_dict_in_generate=True,
-                do_sample=False,
-                pad_token_id=self.tokenizer.pad_token_id,
-            )
+                "max_new_tokens": max_new_tokens,
+                "output_attentions": extract_attention,
+                "return_dict_in_generate": True,
+                "do_sample": temperature > 0,
+                "pad_token_id": self.tokenizer.pad_token_id,
+            }
+            if temperature > 0:
+                generate_kwargs["temperature"] = temperature
+            if stop_strings:
+                generate_kwargs["stop_strings"] = stop_strings
+                generate_kwargs["tokenizer"] = self.tokenizer
+            outputs = self.model.generate(**generate_kwargs)
+        gen_time_ms = (time.time() - gen_start) * 1000
 
         # Process each output
         results = []
-        batch_time = (time.time() - start_time) * 1000
+        batch_time_ms = (time.time() - start_time) * 1000
+        per_task_time_ms = batch_time_ms / len(tasks)
 
         for i, task in enumerate(tasks):
-            # Find where the actual input ends (not padding)
+            # Get actual input length (excluding padding)
             input_ids = inputs.input_ids[i]
-            # Find first non-pad token position
             non_pad_mask = input_ids != self.tokenizer.pad_token_id
             input_length = non_pad_mask.sum().item()
 
-            # Get generated tokens for this sample
-            generated_ids = outputs.sequences[i][input_length:]
-            response = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+            # Get generated tokens
+            full_output_ids = outputs.sequences[i]
+            generated_ids = full_output_ids[input_length:]
 
-            is_correct = self._check_answer(response, task.expected_answer)
+            # Decode
+            full_output_text = self.tokenizer.decode(full_output_ids, skip_special_tokens=True)
+            raw_generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+            response = raw_generated_text.strip()
+
+            is_correct = task.expected_answer.lower() in response.lower()
+            output_token_count = len(generated_ids)
+
+            speed_metrics = SpeedMetrics(
+                tokenization_time_ms=tokenize_time_ms / len(tasks),
+                generation_time_ms=gen_time_ms / len(tasks),
+                total_time_ms=per_task_time_ms,
+                input_tokens=input_length,
+                output_tokens=output_token_count,
+                tokens_per_second=(input_length + output_token_count) / (per_task_time_ms / 1000) if per_task_time_ms > 0 else 0,
+            )
 
             results.append(ModelOutput(
                 task_id=task.task_id,
@@ -328,75 +596,59 @@ class ModelRunner:
                 model_response=response,
                 expected_answer=task.expected_answer,
                 is_correct=is_correct,
+                full_input_text=task.full_prompt,
+                full_output_text=full_output_text,
+                raw_generated_text=raw_generated_text,
+                speed_metrics=speed_metrics,
+                input_token_count=input_length,
+                output_token_count=output_token_count,
                 attentions=None,
                 input_ids=None,
                 tokens=[],
-                generation_time_ms=batch_time / len(tasks),
             ))
 
         return results
 
-    def _check_answer(self, response: str, expected: str) -> bool:
-        """
-        Check if the model's response contains the expected answer.
-
-        Uses case-insensitive matching and checks if the expected location
-        appears in the response.
-        """
-        response_lower = response.lower()
-        expected_lower = expected.lower()
-
-        # Direct containment check
-        if expected_lower in response_lower:
-            return True
-
-        # Check individual words of expected answer
-        expected_words = expected_lower.split()
-        if all(word in response_lower for word in expected_words):
-            return True
-
-        return False
-
     def get_model_info(self) -> Dict:
-        """Get information about the loaded model."""
+        """Get comprehensive information about the loaded model."""
         return {
             "model_name": self.model_name,
             "num_layers": self.num_layers,
             "num_heads": self.num_heads,
-            "device": str(next(self.model.parameters()).device),
+            "hidden_size": self.hidden_size,
+            "device": self.actual_device,
             "dtype": str(self.torch_dtype),
+            "load_time_ms": self.load_time_ms,
+            "optimal_batch_size": self.optimal_batch_size,
         }
 
 
-def load_model(
-    model_name: str = "Qwen/Qwen2.5-3B-Instruct",
-    **kwargs,
-) -> ModelRunner:
-    """Convenience function to load a model."""
-    return ModelRunner(model_name, **kwargs)
-
-
 if __name__ == "__main__":
-    # Quick test
     from .task_generator import generate_tasks
 
-    print("Testing ModelRunner...")
-
     # Generate test tasks
-    tasks = generate_tasks(num_false_belief=4, num_true_belief=4)
+    tasks = generate_tasks(num_families=1)
 
-    # Load model (use small model for testing)
+    # Load model
     runner = ModelRunner("Qwen/Qwen2.5-0.5B-Instruct")
 
-    # Run tasks in batch
-    results = runner.run_batch(tasks, batch_size=4, extract_attention=True, attention_sample_size=2)
+    # Show model info
+    info = runner.get_model_info()
+    print(f"Model: {info['model_name']}")
+    print(f"  Layers: {info['num_layers']}, Heads: {info['num_heads']}")
+    print(f"  Device: {info['device']}")
+    print(f"  Load time: {info['load_time_ms']:.0f}ms")
+    print(f"  Optimal batch size: {info['optimal_batch_size']}")
+
+    # Run tasks
+    results = runner.run_batch(tasks, max_new_tokens=3, stop_strings=["."], extract_attention=True, attention_sample_size=2)
 
     print(f"\nResults:")
     print(f"  Accuracy: {results.accuracy:.1%}")
-    print(f"  Correct: {results.correct_count}/{len(tasks)}")
+    print(f"  Batch size used: {results.batch_size_used}")
+    print(f"  Throughput: {results.tokens_per_second:.1f} tokens/sec")
     print(f"  Total time: {results.total_time_ms:.0f}ms")
 
-    # Show individual results
     for output in results.outputs:
         status = "✓" if output.is_correct else "✗"
         has_attn = "📊" if output.has_attentions() else ""

@@ -264,7 +264,7 @@ class InterventionRunner:
         # Get baseline if not provided
         if baseline_output is None:
             baseline_output = self.model_runner.run_task(
-                task, extract_attention=False
+                task, max_new_tokens=3, stop_strings=[".", "?", "!"], extract_attention=False
             )
 
         # Install hooks
@@ -273,7 +273,7 @@ class InterventionRunner:
         try:
             # Run with intervention
             modified_output = self.model_runner.run_task(
-                task, extract_attention=False
+                task, max_new_tokens=3, stop_strings=[".", "?", "!"], extract_attention=False
             )
         finally:
             # Always remove hooks
@@ -362,7 +362,7 @@ class InterventionRunner:
             print("Computing baseline outputs...")
             baseline_outputs = []
             for task in tqdm(tasks, desc="Baselines"):
-                output = self.model_runner.run_task(task, extract_attention=False)
+                output = self.model_runner.run_task(task, max_new_tokens=3, stop_strings=[".", "?", "!"], extract_attention=False)
                 baseline_outputs.append(output)
 
         # Run interventions

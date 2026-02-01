@@ -1,0 +1,38 @@
+{
+  "version": "1.0",
+  "models": {
+    "Qwen/Qwen2.5-3B": {
+      "model_name": "Qwen/Qwen2.5-3B",
+      "optimal_batch_size": 64,
+      "num_layers": 36,
+      "num_heads": 16,
+      "hidden_size": 2048,
+      "device": "mps:0",
+      "dtype": "torch.bfloat16",
+      "last_optimized": "2026-01-31T15:51:13.084154",
+      "optimization_device": "mps:0"
+    },
+    "mistralai/Mistral-7B-v0.3": {
+      "model_name": "mistralai/Mistral-7B-v0.3",
+      "optimal_batch_size": 64,
+      "num_layers": 32,
+      "num_heads": 32,
+      "hidden_size": 4096,
+      "device": "mps:0",
+      "dtype": "torch.bfloat16",
+      "last_optimized": "2026-01-31T16:02:35.560037",
+      "optimization_device": "mps:0"
+    },
+    "HuggingFaceTB/SmolLM3-3B-Base": {
+      "model_name": "HuggingFaceTB/SmolLM3-3B-Base",
+      "optimal_batch_size": 64,
+      "num_layers": 36,
+      "num_heads": 16,
+      "hidden_size": 2048,
+      "device": "mps:0",
+      "dtype": "torch.bfloat16",
+      "last_optimized": "2026-01-31T16:46:13.466916",
+      "optimization_device": "mps:0"
+    }
+  }
+}

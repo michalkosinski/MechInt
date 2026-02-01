@@ -104,8 +104,9 @@ def run_behavioral_study(
     # Run all tasks with batching
     batch_output = runner.run_batch(
         tasks,
-        batch_size=config.batch_size,
         max_new_tokens=config.max_new_tokens,
+        stop_strings=[".", "?", "!"],
+        batch_size=config.batch_size,
         extract_attention=config.run_attention_analysis,
         attention_sample_size=config.attention_sample_size if config.run_attention_analysis else 0,
     )
