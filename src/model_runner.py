@@ -3,14 +3,21 @@ Model runner for HuggingFace models with attention extraction.
 
 Loads models with output_attentions=True and extracts attention weights
 for analysis of Theory of Mind processing.
+
+All model calls go through _call_model() which handles caching automatically.
 """
 
+import atexit
+import hashlib
 import json
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
+from threading import Lock
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
+
+import numpy as np
 
 
 class HasFullPrompt(Protocol):
@@ -116,6 +123,163 @@ class BatchOutput:
 
 
 # =============================================================================
+# Inference Cache
+# =============================================================================
+
+class InferenceCache:
+    """
+    File-based inference cache with in-memory buffering.
+
+    - Text responses: stored in .inference_cache.json
+    - Hidden states: stored in .cache/hidden_states/{hash}.npz
+
+    Cache key is SHA256 of all serializable parameters.
+    """
+
+    # Class-level registry for atexit cleanup
+    _instances: List["InferenceCache"] = []
+
+    def __init__(
+        self,
+        cache_dir: Path = None,
+        auto_flush_interval: int = 50,
+        enabled: bool = True,
+    ):
+        self.enabled = enabled
+        self.cache_dir = cache_dir or Path(".cache")
+        self.json_cache_file = self.cache_dir / "inference_cache.json"
+        self.hidden_states_dir = self.cache_dir / "hidden_states"
+
+        self._memory_cache: Dict[str, dict] = {}
+        self._dirty = False
+        self._write_count = 0
+        self._auto_flush_interval = auto_flush_interval
+        self._lock = Lock()
+
+        # Stats
+        self._hits = 0
+        self._misses = 0
+
+        if enabled:
+            self._load_from_disk()
+            InferenceCache._instances.append(self)
+
+    def _load_from_disk(self) -> None:
+        """Load JSON cache from disk."""
+        if self.json_cache_file.exists():
+            try:
+                data = json.loads(self.json_cache_file.read_text())
+                self._memory_cache = data.get("entries", {})
+                print(f"Loaded {len(self._memory_cache)} cached entries from {self.json_cache_file}")
+            except (json.JSONDecodeError, KeyError):
+                self._memory_cache = {}
+
+    def _compute_key(self, params: dict) -> str:
+        """Compute SHA256 hash of parameters."""
+        # Remove non-serializable items and sort for determinism
+        serializable = {}
+        for k, v in params.items():
+            if k == "self":
+                continue
+            if isinstance(v, (str, int, float, bool, type(None))):
+                serializable[k] = v
+            elif isinstance(v, (list, tuple)):
+                serializable[k] = list(v)
+            elif isinstance(v, dict):
+                serializable[k] = v
+
+        key_str = json.dumps(serializable, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(key_str.encode()).hexdigest()
+
+    def get(self, cache_key: str, is_hidden_states: bool = False) -> Optional[dict]:
+        """Get cached value by key."""
+        if not self.enabled:
+            return None
+
+        with self._lock:
+            if is_hidden_states:
+                # Check for NPZ file
+                npz_path = self.hidden_states_dir / f"{cache_key}.npz"
+                if npz_path.exists():
+                    self._hits += 1
+                    return {"npz_path": npz_path}
+            else:
+                if cache_key in self._memory_cache:
+                    self._hits += 1
+                    return self._memory_cache[cache_key]
+
+            self._misses += 1
+            return None
+
+    def put(self, cache_key: str, value: dict, is_hidden_states: bool = False) -> None:
+        """Store value in cache."""
+        if not self.enabled:
+            return
+
+        with self._lock:
+            if is_hidden_states:
+                # Store hidden states as NPZ
+                self.hidden_states_dir.mkdir(parents=True, exist_ok=True)
+                npz_path = self.hidden_states_dir / f"{cache_key}.npz"
+                np.savez_compressed(npz_path, **value)
+            else:
+                # Store in JSON cache
+                self._memory_cache[cache_key] = value
+                self._dirty = True
+                self._write_count += 1
+
+                if self._write_count >= self._auto_flush_interval:
+                    self._flush_unlocked()
+
+    def _flush_unlocked(self) -> None:
+        """Flush to disk (caller must hold lock)."""
+        if not self._dirty or not self.enabled:
+            return
+
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # Write to temp file then rename for atomicity
+        tmp_path = self.json_cache_file.with_suffix(".tmp")
+        data = {
+            "version": "1.0",
+            "entries": self._memory_cache,
+        }
+        tmp_path.write_text(json.dumps(data, indent=2))
+        tmp_path.rename(self.json_cache_file)
+
+        self._dirty = False
+        self._write_count = 0
+
+    def flush(self) -> None:
+        """Flush cache to disk."""
+        with self._lock:
+            self._flush_unlocked()
+
+    def get_stats(self) -> dict:
+        """Return cache statistics."""
+        return {
+            "hits": self._hits,
+            "misses": self._misses,
+            "hit_rate": self._hits / (self._hits + self._misses) if (self._hits + self._misses) > 0 else 0,
+            "entries": len(self._memory_cache),
+            "enabled": self.enabled,
+        }
+
+    @classmethod
+    def _flush_all(cls) -> None:
+        """Flush all cache instances (called at exit)."""
+        for instance in cls._instances:
+            try:
+                instance.flush()
+            except Exception:
+                pass
+
+
+# Register atexit handler
+atexit.register(InferenceCache._flush_all)
+
+
+# =============================================================================
 # models.json Helpers
 # =============================================================================
 
@@ -169,6 +333,8 @@ class ModelRunner:
         max_memory: Optional[Dict[str, str]] = None,
         auto_optimize_batch_size: bool = True,
         models_config_path: Optional[Path] = None,
+        use_cache: bool = True,
+        cache_dir: Optional[Path] = None,
     ):
         """
         Initialize the model runner.
@@ -180,11 +346,19 @@ class ModelRunner:
             max_memory: Optional memory constraints per device
             auto_optimize_batch_size: Whether to auto-optimize batch size
             models_config_path: Path to models.json (default: project root)
+            use_cache: Whether to use inference caching
+            cache_dir: Directory for cache files (default: .cache)
         """
         self.model_name = model_name
         self.device = device
         self.torch_dtype = torch_dtype
         self._models_config_path = models_config_path or Path(__file__).parent.parent / "models.json"
+
+        # Initialize cache
+        self._cache = InferenceCache(
+            cache_dir=cache_dir,
+            enabled=use_cache,
+        )
 
         start = time.time()
 
@@ -316,6 +490,189 @@ class ModelRunner:
         self.optimal_batch_size = optimal
         return optimal
 
+    # =========================================================================
+    # Core Model Call (Single Entry Point with Caching)
+    # =========================================================================
+
+    def _call_model(
+        self,
+        prompts: List[str],
+        *,
+        generate: bool = False,
+        max_new_tokens: Optional[int] = None,
+        stop_strings: Optional[List[str]] = None,
+        temperature: float = 0.0,
+        output_hidden_states: bool = False,
+        output_attentions: bool = False,
+    ) -> dict:
+        """
+        Single entry point for all model calls. Handles caching automatically.
+
+        Args:
+            prompts: List of input prompts
+            generate: If True, run model.generate(); if False, run forward pass only
+            max_new_tokens: Max tokens for generation (required if generate=True)
+            stop_strings: Stop strings for generation
+            temperature: Sampling temperature (0 for greedy)
+            output_hidden_states: Whether to output hidden states
+            output_attentions: Whether to output attention weights
+
+        Returns:
+            Dict with keys depending on operation:
+            - For generate: sequences, raw_texts, input_lengths, tokens
+            - For forward: logits, hidden_states (if requested)
+        """
+        # Build cache key from ALL parameters
+        cache_params = {
+            "model_name": self.model_name,
+            "prompts": prompts,
+            "generate": generate,
+            "max_new_tokens": max_new_tokens,
+            "stop_strings": sorted(stop_strings) if stop_strings else None,
+            "temperature": temperature,
+            "output_hidden_states": output_hidden_states,
+            "output_attentions": output_attentions,
+        }
+        cache_key = self._cache._compute_key(cache_params)
+
+        # Check cache (skip for attention - need fresh tensors)
+        is_hidden_states = output_hidden_states and not generate
+        if not output_attentions:
+            cached = self._cache.get(cache_key, is_hidden_states=is_hidden_states)
+            if cached is not None:
+                if is_hidden_states and "npz_path" in cached:
+                    # Load hidden states from NPZ
+                    npz_data = np.load(cached["npz_path"], allow_pickle=True)
+                    return dict(npz_data)
+                # Convert sequences back to tensor if present
+                if "sequences" in cached and isinstance(cached["sequences"], list):
+                    cached = cached.copy()  # Don't mutate cache
+                    cached["sequences"] = torch.tensor(cached["sequences"])
+                return cached
+
+        # Tokenize
+        inputs = self.tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        ).to(self.model.device)
+
+        # Call model
+        with torch.no_grad():
+            if generate:
+                generate_kwargs = {
+                    **{k: v for k, v in inputs.items()},
+                    "max_new_tokens": max_new_tokens,
+                    "output_attentions": output_attentions,
+                    "output_hidden_states": output_hidden_states,
+                    "return_dict_in_generate": True,
+                    "do_sample": temperature > 0,
+                    "pad_token_id": self.tokenizer.pad_token_id,
+                }
+                if temperature > 0:
+                    generate_kwargs["temperature"] = temperature
+                if stop_strings:
+                    generate_kwargs["stop_strings"] = stop_strings
+                    generate_kwargs["tokenizer"] = self.tokenizer
+
+                outputs = self.model.generate(**generate_kwargs)
+                result = self._format_generate_output(outputs, inputs, output_attentions)
+            else:
+                outputs = self.model(
+                    **inputs,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=True,
+                )
+                result = self._format_forward_output(outputs, inputs, output_hidden_states)
+
+        # Cache result (skip attention tensors, skip hidden states for JSON)
+        if not output_attentions:
+            if is_hidden_states:
+                # Save hidden states as NPZ
+                save_data = {
+                    "input_ids": inputs.input_ids.cpu().numpy(),
+                    "input_lengths": [
+                        int((inputs.input_ids[i] != self.tokenizer.pad_token_id).sum().item())
+                        for i in range(len(prompts))
+                    ],
+                }
+                if "hidden_states" in result:
+                    for layer_i, hs in enumerate(result["hidden_states"]):
+                        # Convert to float32 for numpy (bfloat16 not supported)
+                        hs_cpu = hs.cpu().float() if hasattr(hs, 'cpu') else hs
+                        save_data[f"hidden_layer_{layer_i}"] = hs_cpu.numpy() if hasattr(hs_cpu, 'numpy') else hs_cpu
+                if "logits" in result:
+                    logits_cpu = result["logits"].cpu().float() if hasattr(result["logits"], 'cpu') else result["logits"]
+                    save_data["logits"] = logits_cpu.numpy() if hasattr(logits_cpu, 'numpy') else logits_cpu
+                self._cache.put(cache_key, save_data, is_hidden_states=True)
+            else:
+                # Save text results as JSON - convert tensors to lists
+                cache_data = {}
+                for k, v in result.items():
+                    if k in ("attentions", "hidden_states"):
+                        continue
+                    if hasattr(v, 'tolist'):  # tensor or numpy array
+                        cache_data[k] = v.tolist()
+                    else:
+                        cache_data[k] = v
+                self._cache.put(cache_key, cache_data)
+
+        return result
+
+    def _format_generate_output(self, outputs, inputs, output_attentions: bool) -> dict:
+        """Format generation output to dict."""
+        batch_size = inputs.input_ids.shape[0]
+        result = {
+            "sequences": outputs.sequences.cpu(),
+            "raw_texts": [],
+            "input_lengths": [],
+            "tokens": [],
+        }
+
+        for i in range(batch_size):
+            input_ids = inputs.input_ids[i]
+            non_pad_mask = input_ids != self.tokenizer.pad_token_id
+            input_length = int(non_pad_mask.sum().item())
+            result["input_lengths"].append(input_length)
+
+            full_output_ids = outputs.sequences[i]
+            generated_ids = full_output_ids[input_length:]
+            raw_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+            result["raw_texts"].append(raw_text)
+
+            tokens = self.tokenizer.convert_ids_to_tokens(input_ids)
+            result["tokens"].append(tokens)
+
+        if output_attentions and hasattr(outputs, "attentions") and outputs.attentions:
+            result["attentions"] = outputs.attentions
+
+        return result
+
+    def _format_forward_output(self, outputs, inputs, output_hidden_states: bool) -> dict:
+        """Format forward pass output to dict."""
+        result = {
+            "logits": outputs.logits.cpu(),
+            "input_ids": inputs.input_ids.cpu(),
+            "input_lengths": [
+                int((inputs.input_ids[i] != self.tokenizer.pad_token_id).sum().item())
+                for i in range(inputs.input_ids.shape[0])
+            ],
+        }
+
+        if output_hidden_states and hasattr(outputs, "hidden_states") and outputs.hidden_states:
+            result["hidden_states"] = [hs.cpu() for hs in outputs.hidden_states]
+
+        return result
+
+    def get_cache_stats(self) -> dict:
+        """Get cache statistics."""
+        return self._cache.get_stats()
+
+    # =========================================================================
+    # Public API (thin wrappers around _call_model)
+    # =========================================================================
+
     def run_task(
         self,
         task: ToMTask,
@@ -338,62 +695,46 @@ class ModelRunner:
             ModelOutput with response, correctness, timing, and optionally attention
         """
         total_start = time.time()
-
-        # Tokenization
-        tokenize_start = time.time()
         input_text = NO_REASONING_PREFIX + task.full_prompt
-        inputs = self.tokenizer(
-            input_text,
-            return_tensors="pt",
-            padding=True,
-        ).to(self.model.device)
-        input_length = inputs.input_ids.shape[1]
-        tokens = self.tokenizer.convert_ids_to_tokens(inputs.input_ids[0])
-        tokenize_time_ms = (time.time() - tokenize_start) * 1000
 
-        # Generation
-        gen_start = time.time()
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                output_attentions=extract_attention,
-                return_dict_in_generate=True,
-                do_sample=temperature > 0,
-                temperature=temperature if temperature > 0 else None,
-                pad_token_id=self.tokenizer.pad_token_id,
-                stop_strings=stop_strings,
-                tokenizer=self.tokenizer,
-            )
-        gen_time_ms = (time.time() - gen_start) * 1000
-
-        # Decoding
-        decode_start = time.time()
-        full_output_ids = outputs.sequences[0]
-        generated_ids = full_output_ids[input_length:]
-
-        full_output_text = self.tokenizer.decode(full_output_ids, skip_special_tokens=True)
-        raw_generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-        response = raw_generated_text.strip()
-        decode_time_ms = (time.time() - decode_start) * 1000
+        # Call model via unified entry point
+        result = self._call_model(
+            prompts=[input_text],
+            generate=True,
+            max_new_tokens=max_new_tokens,
+            stop_strings=stop_strings,
+            temperature=temperature,
+            output_attentions=extract_attention,
+        )
 
         total_time_ms = (time.time() - total_start) * 1000
 
+        # Extract results for single task (index 0)
+        raw_generated_text = result["raw_texts"][0]
+        response = raw_generated_text.strip()
+        input_length = result["input_lengths"][0]
+        tokens = result["tokens"][0]
+
+        # Decode full output
+        full_output_ids = result["sequences"][0]
+        full_output_text = self.tokenizer.decode(full_output_ids, skip_special_tokens=True)
+
         # Attention extraction
         attentions = None
-        if extract_attention and hasattr(outputs, "attentions") and outputs.attentions:
-            if outputs.attentions[0] is not None:
+        if extract_attention and "attentions" in result and result["attentions"]:
+            if result["attentions"][0] is not None:
                 attentions = tuple(
-                    layer_attn.cpu() for layer_attn in outputs.attentions[0]
+                    layer_attn.cpu() for layer_attn in result["attentions"][0]
                 )
 
         # Speed metrics
+        generated_ids = full_output_ids[input_length:]
         output_token_count = len(generated_ids)
         speed_metrics = SpeedMetrics(
             model_load_time_ms=0.0,
-            tokenization_time_ms=tokenize_time_ms,
-            generation_time_ms=gen_time_ms,
-            decoding_time_ms=decode_time_ms,
+            tokenization_time_ms=0.0,
+            generation_time_ms=total_time_ms,
+            decoding_time_ms=0.0,
             total_time_ms=total_time_ms,
             input_tokens=input_length,
             output_tokens=output_token_count,
@@ -414,7 +755,7 @@ class ModelRunner:
             input_token_count=input_length,
             output_token_count=output_token_count,
             attentions=attentions,
-            input_ids=inputs.input_ids.cpu(),
+            input_ids=result["sequences"][:1],  # Keep tensor shape
             tokens=tokens,
         )
 
@@ -553,32 +894,40 @@ class ModelRunner:
             batch_tasks = tasks[batch_start:batch_end]
 
             prompts = [task.full_prompt for task in batch_tasks]
-            inputs = self.tokenizer(
-                prompts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-            ).to(self.model.device)
 
-            with torch.no_grad():
-                outputs = self.model(
-                    **inputs,
-                    output_hidden_states=True,
-                    use_cache=False,
-                    return_dict=True,
-                )
+            # Call model via unified entry point
+            result = self._call_model(
+                prompts=prompts,
+                generate=False,
+                output_hidden_states=True,
+            )
 
-            hidden_states = outputs.hidden_states
+            # Check if loaded from NPZ cache
+            if "hidden_layer_0" in result:
+                # Loaded from NPZ - reconstruct
+                num_layers = sum(1 for k in result.keys() if k.startswith("hidden_layer_"))
+                for i, task in enumerate(batch_tasks):
+                    input_ids = torch.tensor(result["input_ids"][i])
+                    input_length = result["input_lengths"][i]
+                    tokens = self.tokenizer.convert_ids_to_tokens(input_ids)
 
-            for i, task in enumerate(batch_tasks):
-                input_ids = inputs.input_ids[i]
-                non_pad_mask = input_ids != self.tokenizer.pad_token_id
-                input_length = int(non_pad_mask.sum().item())
-                tokens = self.tokenizer.convert_ids_to_tokens(input_ids)
+                    per_task_hidden = tuple(
+                        torch.tensor(result[f"hidden_layer_{layer}"][i])
+                        for layer in range(num_layers)
+                    )
+                    yield task, input_ids, tokens, per_task_hidden, input_length
+            else:
+                # Fresh from model - result has tensors
+                hidden_states = result["hidden_states"]
+                input_ids_batch = result["input_ids"]
 
-                per_task_hidden = tuple(layer[i].cpu() for layer in hidden_states)
+                for i, task in enumerate(batch_tasks):
+                    input_ids = input_ids_batch[i]
+                    input_length = result["input_lengths"][i]
+                    tokens = self.tokenizer.convert_ids_to_tokens(input_ids)
 
-                yield task, input_ids.cpu(), tokens, per_task_hidden, input_length
+                    per_task_hidden = tuple(layer[i].cpu() for layer in hidden_states)
+                    yield task, input_ids.cpu(), tokens, per_task_hidden, input_length
 
     def _run_batch_internal(
         self,
@@ -597,62 +946,37 @@ class ModelRunner:
             return []
 
         start_time = time.time()
-
-        # Tokenization
-        tokenize_start = time.time()
         prompts = [NO_REASONING_PREFIX + task.full_prompt for task in tasks]
-        inputs = self.tokenizer(
-            prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-        ).to(self.model.device)
-        tokenize_time_ms = (time.time() - tokenize_start) * 1000
 
-        # Generation
-        gen_start = time.time()
-        with torch.no_grad():
-            generate_kwargs = {
-                **inputs,
-                "max_new_tokens": max_new_tokens,
-                "output_attentions": extract_attention,
-                "return_dict_in_generate": True,
-                "do_sample": temperature > 0,
-                "pad_token_id": self.tokenizer.pad_token_id,
-            }
-            if temperature > 0:
-                generate_kwargs["temperature"] = temperature
-            if stop_strings:
-                generate_kwargs["stop_strings"] = stop_strings
-                generate_kwargs["tokenizer"] = self.tokenizer
-            outputs = self.model.generate(**generate_kwargs)
-        gen_time_ms = (time.time() - gen_start) * 1000
+        # Call model via unified entry point
+        result = self._call_model(
+            prompts=prompts,
+            generate=True,
+            max_new_tokens=max_new_tokens,
+            stop_strings=stop_strings,
+            temperature=temperature,
+            output_attentions=extract_attention,
+        )
 
-        # Process each output
-        results = []
         batch_time_ms = (time.time() - start_time) * 1000
         per_task_time_ms = batch_time_ms / len(tasks)
 
+        # Process each output
+        results = []
         for i, task in enumerate(tasks):
-            # Get actual input length (excluding padding)
-            input_ids = inputs.input_ids[i]
-            non_pad_mask = input_ids != self.tokenizer.pad_token_id
-            input_length = non_pad_mask.sum().item()
-
-            # Get generated tokens
-            full_output_ids = outputs.sequences[i]
-            generated_ids = full_output_ids[input_length:]
-
-            # Decode
-            full_output_text = self.tokenizer.decode(full_output_ids, skip_special_tokens=True)
-            raw_generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+            input_length = result["input_lengths"][i]
+            raw_generated_text = result["raw_texts"][i]
             response = raw_generated_text.strip()
+
+            full_output_ids = result["sequences"][i]
+            generated_ids = full_output_ids[input_length:]
+            full_output_text = self.tokenizer.decode(full_output_ids, skip_special_tokens=True)
 
             output_token_count = len(generated_ids)
 
             speed_metrics = SpeedMetrics(
-                tokenization_time_ms=tokenize_time_ms / len(tasks),
-                generation_time_ms=gen_time_ms / len(tasks),
+                tokenization_time_ms=0.0,
+                generation_time_ms=batch_time_ms / len(tasks),
                 total_time_ms=per_task_time_ms,
                 input_tokens=input_length,
                 output_tokens=output_token_count,
@@ -666,7 +990,7 @@ class ModelRunner:
                 model_response=response,
                 expected_answer=getattr(task, 'expected_answer', None),
                 is_correct=False,  # Scoring done by behavioral_analysis
-                full_input_text=task.full_prompt,
+                full_input_text=prompts[i],
                 full_output_text=full_output_text,
                 raw_generated_text=raw_generated_text,
                 speed_metrics=speed_metrics,
@@ -710,12 +1034,22 @@ class ModelRunner:
         Returns:
             Dict mapping each candidate to its probability
         """
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        # Call model via unified entry point
+        model_result = self._call_model(
+            prompts=[prompt],
+            generate=False,
+        )
 
-        with torch.no_grad():
-            outputs = self.model(input_ids=inputs.input_ids)
-            logits = outputs.logits[:, -1, :]  # Last position logits
-            probs = torch.softmax(logits, dim=-1)
+        # Get logits (from cache or fresh) - may be tensor, numpy array, or list
+        logits = model_result["logits"]
+        if isinstance(logits, list):
+            logits = torch.tensor(logits)
+        elif isinstance(logits, np.ndarray):
+            logits = torch.tensor(logits)
+
+        # Get last position logits and compute probabilities
+        last_logits = logits[0, -1, :]  # Last position logits for first (only) prompt
+        probs = torch.softmax(last_logits, dim=-1)
 
         result = {}
         for candidate in candidates:
@@ -723,7 +1057,7 @@ class ModelRunner:
             token_ids = self.tokenizer.encode(candidate, add_special_tokens=False)
             if token_ids:
                 # Use first token probability
-                result[candidate] = probs[0, token_ids[0]].item()
+                result[candidate] = probs[token_ids[0]].item()
             else:
                 result[candidate] = 0.0
 

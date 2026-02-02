@@ -35,3 +35,6 @@ Thumbs.db
 
 # Pytest
 .pytest_cache/
+
+# Inference cache
+.cache/
