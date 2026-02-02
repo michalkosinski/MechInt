@@ -13,6 +13,8 @@ Usage:
 """
 
 import argparse
+import csv
+import io
 import json
 import os
 import re
@@ -123,6 +125,36 @@ class Dashboard:
                 return json.loads(metrics_path.read_text())
         return None
 
+    def get_probing_predictions(self) -> Optional[Dict]:
+        """Load per-task probing predictions for the selected model."""
+        probing_dir = self.results_dir / "probing"
+        if self.model:
+            model_dir = probing_dir / self.model.replace("/", "_")
+            predictions_path = model_dir / "probe_predictions.json"
+            if predictions_path.exists():
+                return json.loads(predictions_path.read_text())
+            return None
+
+        if probing_dir.exists():
+            for predictions_path in probing_dir.glob("*/probe_predictions.json"):
+                return json.loads(predictions_path.read_text())
+        return None
+
+    def get_attention_results(self) -> Optional[Dict]:
+        """Load attention results for the selected model (if available)."""
+        attention_dir = self.results_dir / "attention"
+        if self.model:
+            model_dir = attention_dir / self.model.replace("/", "_")
+            metrics_path = model_dir / "attention_metrics.json"
+            if metrics_path.exists():
+                return json.loads(metrics_path.read_text())
+            return None
+
+        if attention_dir.exists():
+            for metrics_path in attention_dir.glob("*/attention_metrics.json"):
+                return json.loads(metrics_path.read_text())
+        return None
+
 
 # Global dashboard instance (will be recreated per-request with model)
 dashboard = Dashboard()
@@ -142,6 +174,7 @@ def render_page(title: str, content: str, nav_active: str = "", selected_model: 
         ("Overview", "/"),
         ("Tasks", "/tasks"),
         ("Probing", "/probing"),
+        ("Attention", "/attention"),
     ]
 
     nav_html = "\n".join([
@@ -386,7 +419,7 @@ def render_page(title: str, content: str, nav_active: str = "", selected_model: 
             width: 200px;
             height: 16px;
             border-radius: 4px;
-            background: linear-gradient(to right, #1a1f26, #1d9bf0, #00ba7c);
+            background: linear-gradient(to right, hsl(0, 70%, 25%), hsl(60, 70%, 35%), hsl(120, 70%, 45%));
         }}
 
         .empty-state {{
@@ -902,11 +935,12 @@ def render_tasks(selected_model: Optional[str] = None) -> str:
 
 
 def _accuracy_color(acc: float) -> str:
-    """Generate color for accuracy value (0-1 scale)."""
-    acc = max(0.0, min(1.0, acc))
-    # Blue (low) -> Cyan (mid) -> Green (high)
-    hue = 200 + (120 * acc)
-    light = 18 + (30 * acc)
+    """Generate color for accuracy (0.5=chance → 1.0=perfect)."""
+    # Normalize: 0.5 (chance) → 0, 1.0 (perfect) → 1
+    normalized = max(0.0, min(1.0, (acc - 0.5) * 2))
+    # Red (bad) → Yellow (ok) → Green (good)
+    hue = 120 * normalized  # 0=red, 60=yellow, 120=green
+    light = 25 + (20 * normalized)
     return f"hsl({hue:.0f}, 70%, {light:.0f}%)"
 
 
@@ -919,6 +953,68 @@ def _delta_color(delta: float) -> str:
     return "warning"
 
 
+def _render_layer_accuracy_svg(metrics: list, width: int = 700, height: int = 220) -> str:
+    """Generate SVG line chart of accuracy by layer."""
+    if not metrics:
+        return ""
+
+    layers = [m["layer"] for m in metrics]
+    accs = [m["accuracy"] for m in metrics]
+
+    # SVG coordinates
+    margin_left, margin_right, margin_top, margin_bottom = 50, 20, 20, 35
+    plot_width = width - margin_left - margin_right
+    plot_height = height - margin_top - margin_bottom
+
+    # Scale: x = layers, y = 0.5 to 1.0
+    x_scale = plot_width / max(1, len(layers) - 1)
+    y_min, y_max = 0.5, 1.0
+    y_scale = plot_height / (y_max - y_min)
+
+    # Build line path
+    points = []
+    for i, (layer, acc) in enumerate(zip(layers, accs)):
+        x = margin_left + i * x_scale
+        y = margin_top + plot_height - (acc - y_min) * y_scale
+        points.append(f"{x:.1f},{y:.1f}")
+    path_d = "M" + " L".join(points)
+
+    # Y-axis ticks
+    y_ticks = ""
+    for val in [0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
+        y_pos = margin_top + plot_height - (val - y_min) * y_scale
+        y_ticks += f'<line x1="{margin_left - 5}" y1="{y_pos:.1f}" x2="{margin_left}" y2="{y_pos:.1f}" stroke="#666"/>'
+        y_ticks += f'<text x="{margin_left - 8}" y="{y_pos + 4:.1f}" text-anchor="end" fill="#888" font-size="11">{val*100:.0f}%</text>'
+
+    # X-axis ticks (every 5 layers)
+    x_ticks = ""
+    for i, layer in enumerate(layers):
+        if layer % 5 == 0 or layer == layers[-1]:
+            x_pos = margin_left + i * x_scale
+            x_ticks += f'<line x1="{x_pos:.1f}" y1="{margin_top + plot_height}" x2="{x_pos:.1f}" y2="{margin_top + plot_height + 5}" stroke="#666"/>'
+            x_ticks += f'<text x="{x_pos:.1f}" y="{margin_top + plot_height + 18}" text-anchor="middle" fill="#888" font-size="11">{layer}</text>'
+
+    # 50% baseline
+    baseline_y = margin_top + plot_height - (0.5 - y_min) * y_scale
+
+    return f'''
+    <svg viewBox="0 0 {width} {height}" class="layer-accuracy-chart" style="width: 100%; max-width: {width}px; height: auto;">
+        <!-- Grid -->
+        <line x1="{margin_left}" y1="{baseline_y:.1f}" x2="{margin_left + plot_width}" y2="{baseline_y:.1f}" stroke="#444" stroke-dasharray="4"/>
+        <!-- Axes -->
+        <line x1="{margin_left}" y1="{margin_top}" x2="{margin_left}" y2="{margin_top + plot_height}" stroke="#666"/>
+        <line x1="{margin_left}" y1="{margin_top + plot_height}" x2="{margin_left + plot_width}" y2="{margin_top + plot_height}" stroke="#666"/>
+        {y_ticks}
+        {x_ticks}
+        <!-- Data line -->
+        <path d="{path_d}" fill="none" stroke="#1d9bf0" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <!-- Axis labels -->
+        <text x="{margin_left + plot_width/2}" y="{height - 5}" text-anchor="middle" fill="#888" font-size="12">Layer</text>
+        <text x="15" y="{margin_top + plot_height/2}" text-anchor="middle" fill="#888" font-size="12" transform="rotate(-90, 15, {margin_top + plot_height/2})">Accuracy</text>
+    </svg>
+    '''
+
+
 # Probe label explanations
 PROBE_EXPLANATIONS = {
     "false_belief": {
@@ -926,6 +1022,18 @@ PROBE_EXPLANATIONS = {
         "question": "Can we decode WHETHER the protagonist has a false belief?",
         "description": "Tests if hidden states encode that the protagonist's belief differs from reality.",
         "labels": "0 = true belief (belief = reality), 1 = false belief (belief ≠ reality)",
+    },
+    "world_location": {
+        "title": "World Location (Reality)",
+        "question": "Can we decode WHERE the object actually is?",
+        "description": "Tests if hidden states encode the true location of the object in the world.",
+        "labels": "0 = object in C2, 1 = object in C1 (canonical first container)",
+    },
+    "belief_location": {
+        "title": "Belief Location",
+        "question": "Can we decode WHERE the protagonist believes the object is?",
+        "description": "Tests if hidden states encode the protagonist's belief about object location.",
+        "labels": "0 = believes in C2, 1 = believes in C1 (canonical first container)",
     },
 }
 
@@ -1020,6 +1128,15 @@ def render_probing(selected_model: Optional[str] = None) -> str:
                     <span class="config-label">Probe Train (ms)</span>
                     <span class="config-value">{timing.get('probe_train_time_ms', 0.0):.0f}</span>
                 </div>
+            </div>
+            <div class="download-section" style="margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--border);">
+                <a href="/probing/download/csv{'?model=' + selected_model if selected_model else ''}" class="download-btn" download>
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16" style="margin-right: 0.5rem;">
+                        <path d="M.5 9.9a.5.5 0 0 1 .5.5v2.5a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-2.5a.5.5 0 0 1 1 0v2.5a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2v-2.5a.5.5 0 0 1 .5-.5z"/>
+                        <path d="M7.646 11.854a.5.5 0 0 0 .708 0l3-3a.5.5 0 0 0-.708-.708L8.5 10.293V1.5a.5.5 0 0 0-1 0v8.793L5.354 8.146a.5.5 0 1 0-.708.708l3 3z"/>
+                    </svg>
+                    Download Predictions (CSV)
+                </a>
             </div>
         </div>
     """
@@ -1158,6 +1275,11 @@ def render_probing(selected_model: Optional[str] = None) -> str:
                     </div>
                 </div>
 
+                <div class="chart-container">
+                    <h4>Accuracy Curve</h4>
+                    {_render_layer_accuracy_svg(metrics)}
+                </div>
+
                 <details class="metrics-details">
                     <summary>Full Metrics Table</summary>
                     <table>
@@ -1229,6 +1351,23 @@ def render_probing(selected_model: Optional[str] = None) -> str:
             .config-value {
                 font-weight: 600;
                 color: var(--text-primary);
+            }
+
+            .download-btn {
+                display: inline-flex;
+                align-items: center;
+                padding: 0.5rem 1rem;
+                background: var(--accent);
+                color: white;
+                border-radius: 6px;
+                text-decoration: none;
+                font-size: 0.875rem;
+                font-weight: 500;
+                transition: background 0.2s;
+            }
+
+            .download-btn:hover {
+                background: #1a8cd8;
             }
 
             .probe-section {
@@ -1452,6 +1591,450 @@ def render_probing(selected_model: Optional[str] = None) -> str:
     return render_page("Probing", content, "Probing", selected_model=selected_model)
 
 
+# Attention analysis explanations
+ATTENTION_EXPLANATIONS = {
+    "belief_tracking_score": {
+        "title": "Belief Tracking Score",
+        "question": "Does this head attend to what the protagonist BELIEVES vs what is TRUE?",
+        "description": "Measures log(attention_to_belief / attention_to_world) for false-belief tasks. "
+                       "Positive scores indicate the head preferentially attends to the protagonist's "
+                       "believed location rather than the actual location.",
+        "interpretation": "> 0.5: Strong belief tracking, 0-0.5: Moderate, < 0: Reality tracking",
+    },
+    "differential_score": {
+        "title": "FB vs TB Differential",
+        "question": "Does this head behave differently on false-belief vs true-belief tasks?",
+        "description": "Difference in attention to belief token between FB and TB tasks. "
+                       "Large positive values indicate the head specifically activates for FB scenarios.",
+    },
+}
+
+
+def generate_probing_csv(selected_model: Optional[str] = None) -> str:
+    """Generate CSV with probing predictions and task metadata."""
+    dash = get_dashboard(selected_model)
+    probing = dash.get_probing_results()
+    predictions = dash.get_probing_predictions()
+    tasks = dash.get_tasks()
+
+    if not probing or not predictions or not tasks:
+        return ""
+
+    # Build task lookup
+    task_lookup = {t["task_id"]: t for t in tasks}
+    results = probing.get("results", {})
+
+    # Collect all rows with predictions from all probe types
+    rows: List[Dict[str, Any]] = []
+    task_data: Dict[str, Dict[str, Any]] = {}
+
+    for label_type, label_results in results.items():
+        best_layer = label_results.get("best_layer")
+        if best_layer is None:
+            continue
+
+        layer_preds = predictions.get(label_type, {}).get(str(best_layer), {})
+
+        for task_id, pred in layer_preds.items():
+            if task_id not in task_data:
+                task = task_lookup.get(task_id, {})
+                task_data[task_id] = {
+                    "task_id": task_id,
+                    "family_id": task.get("family_id", ""),
+                    "task_type": task.get("task_type", ""),
+                    "world": task.get("world", ""),
+                    "belief": task.get("belief", ""),
+                    "c1": task.get("c1", ""),
+                    "c2": task.get("c2", ""),
+                }
+            task_data[task_id][f"{label_type}_prob"] = pred.get("prob", "")
+            task_data[task_id][f"{label_type}_label"] = pred.get("label", "")
+            task_data[task_id][f"{label_type}_layer"] = best_layer
+
+    rows = list(task_data.values())
+    if not rows:
+        return ""
+
+    # Write CSV
+    output = io.StringIO()
+    fieldnames = list(rows[0].keys())
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows)
+
+    return output.getvalue()
+
+
+def render_attention(selected_model: Optional[str] = None) -> str:
+    """Render attention analysis page with detailed explanations."""
+    attention_dashboard = get_dashboard(selected_model)
+    attention = attention_dashboard.get_attention_results()
+
+    if not attention:
+        attention_dir = RESULTS_DIR / "attention"
+        available_attention_models = []
+        if attention_dir.exists():
+            for metrics_path in attention_dir.glob("*/attention_metrics.json"):
+                available_attention_models.append(metrics_path.parent.name)
+        available_attention_models.sort()
+        expected_metrics_path = "N/A"
+        if selected_model:
+            expected_metrics_path = str(Path("results") / "attention" / selected_model.replace("/", "_") / "attention_metrics.json")
+        available_models_display = ", ".join(available_attention_models) if available_attention_models else "None found"
+
+        return render_page("Attention", f"""
+            <h1>Attention Analysis</h1>
+            <div class="empty-state">
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                </svg>
+                <p>No attention results found.</p>
+                <p>Run <code>python -m src.attention_analysis</code> to generate attention results.</p>
+                <div class="debug-info">
+                    <p><strong>Expected metrics path:</strong> <code>{html_module.escape(expected_metrics_path)}</code></p>
+                    <p><strong>Available attention models:</strong> {html_module.escape(available_models_display)}</p>
+                </div>
+            </div>
+        """, "Attention", selected_model=selected_model)
+
+    model_name = attention.get("model_name", selected_model or "Unknown")
+    timestamp = attention.get("timestamp", "N/A")
+    config = attention.get("config", {})
+    results = attention.get("results", {})
+    summary = attention.get("summary", {})
+    sanity = attention.get("sanity_checks", {})
+    model_info = attention.get("model_info", {})
+    timing = attention.get("timing", {})
+
+    num_layers = model_info.get("num_layers", 0)
+    num_heads = model_info.get("num_heads", 0)
+
+    # Configuration panel
+    config_html = f"""
+        <div class="config-panel">
+            <h3>Analysis Configuration</h3>
+            <div class="config-grid">
+                <div class="config-item">
+                    <span class="config-label">Tasks Analyzed</span>
+                    <span class="config-value">{summary.get('tasks_analyzed', 0)}</span>
+                </div>
+                <div class="config-item">
+                    <span class="config-label">FB Tasks</span>
+                    <span class="config-value">{summary.get('fb_tasks', 0)}</span>
+                </div>
+                <div class="config-item">
+                    <span class="config-label">TB Tasks</span>
+                    <span class="config-value">{summary.get('tb_tasks', 0)}</span>
+                </div>
+                <div class="config-item">
+                    <span class="config-label">Layers</span>
+                    <span class="config-value">{num_layers}</span>
+                </div>
+                <div class="config-item">
+                    <span class="config-label">Heads/Layer</span>
+                    <span class="config-value">{num_heads}</span>
+                </div>
+                <div class="config-item">
+                    <span class="config-label">Time (ms)</span>
+                    <span class="config-value">{timing.get('total_time_ms', 0):.0f}</span>
+                </div>
+            </div>
+        </div>
+    """
+
+    # Sanity check panel
+    sanity_warnings = sanity.get("token_position_warnings", 0) + sanity.get("attention_sum_warnings", 0)
+    sanity_class = "success" if sanity_warnings == 0 else "warning" if sanity_warnings < 5 else "error"
+    sanity_html = f"""
+        <div class="sanity-panel">
+            <h3>Sanity Checks</h3>
+            <div class="config-grid">
+                <div class="config-item">
+                    <span class="config-label">Token Position Warnings</span>
+                    <span class="config-value {sanity_class}">{sanity.get('token_position_warnings', 0)}</span>
+                </div>
+                <div class="config-item">
+                    <span class="config-label">Attention Sum Warnings</span>
+                    <span class="config-value {sanity_class}">{sanity.get('attention_sum_warnings', 0)}</span>
+                </div>
+                <div class="config-item">
+                    <span class="config-label">Tasks Skipped</span>
+                    <span class="config-value">{sanity.get('tasks_skipped', 0)}</span>
+                </div>
+            </div>
+        </div>
+    """
+
+    # Top belief-tracking heads table
+    top_belief_tracking = results.get("top_belief_tracking_heads", [])[:10]
+    head_metrics = {(m["layer"], m["head"]): m for m in results.get("head_metrics", [])}
+
+    tracking_rows = []
+    for i, h in enumerate(top_belief_tracking, 1):
+        layer, head, score = h["layer"], h["head"], h["score"]
+        full_metrics = head_metrics.get((layer, head), {})
+        belief_fb = full_metrics.get("belief_attention_fb", 0) * 100
+        world_fb = full_metrics.get("world_attention_fb", 0) * 100
+        ratio = full_metrics.get("belief_over_world_ratio", 1.0)
+
+        score_class = "success" if score > 0.5 else "warning" if score > 0 else "error"
+        tracking_rows.append(f"""
+            <tr>
+                <td>{i}</td>
+                <td>Layer {layer}</td>
+                <td>Head {head}</td>
+                <td class="{score_class}"><strong>{score:.3f}</strong></td>
+                <td>{belief_fb:.2f}%</td>
+                <td>{world_fb:.2f}%</td>
+                <td>{ratio:.2f}</td>
+            </tr>
+        """)
+
+    # Top differentiating heads table
+    top_differentiating = results.get("top_differentiating_heads", [])[:10]
+    diff_rows = []
+    for i, h in enumerate(top_differentiating, 1):
+        layer, head = h["layer"], h["head"]
+        diff = h["diff"]
+        p_value = h.get("p_value", 1.0)
+        full_metrics = head_metrics.get((layer, head), {})
+        belief_fb = full_metrics.get("belief_attention_fb", 0) * 100
+        belief_tb = full_metrics.get("belief_attention_tb", 0) * 100
+
+        sig_badge = '<span class="badge success">sig</span>' if p_value < 0.05 else '<span class="badge info">ns</span>'
+        diff_class = "success" if diff > 0.01 else "warning" if diff > 0 else "error"
+        diff_rows.append(f"""
+            <tr>
+                <td>{i}</td>
+                <td>Layer {layer}</td>
+                <td>Head {head}</td>
+                <td class="{diff_class}"><strong>{diff*100:.2f}%</strong></td>
+                <td>{belief_fb:.2f}%</td>
+                <td>{belief_tb:.2f}%</td>
+                <td>{p_value:.4f} {sig_badge}</td>
+            </tr>
+        """)
+
+    # Layer heatmap for belief tracking score
+    layer_aggregates = results.get("layer_aggregates", {})
+    heatmap_cells = []
+    for layer in range(num_layers):
+        layer_data = layer_aggregates.get(str(layer), {})
+        max_score = layer_data.get("max_belief_tracking", 0)
+        # Color: negative=red, 0=gray, positive=green
+        if max_score > 0:
+            hue = 120  # Green
+            sat = min(70, max_score * 100)
+            light = 25 + min(25, max_score * 30)
+        else:
+            hue = 0  # Red
+            sat = min(70, abs(max_score) * 100)
+            light = 25 + min(25, abs(max_score) * 30)
+
+        color = f"hsl({hue}, {sat}%, {light}%)"
+        heatmap_cells.append(
+            f"<div class='heatmap-cell' title='Layer {layer}: max={max_score:.3f}' "
+            f"style='background: {color}'>{layer}</div>"
+        )
+
+    # Summary cards
+    best_head = summary.get("best_belief_tracking_head", {})
+    best_score = summary.get("best_belief_tracking_score", 0)
+
+    cards = f"""
+        <div class="card-grid">
+            <div class="card">
+                <h3>Best Belief Tracking Head</h3>
+                <div class="value">L{best_head.get('layer', '?')}H{best_head.get('head', '?')}</div>
+                <div class="subtext">Layer {best_head.get('layer', '?')}, Head {best_head.get('head', '?')}</div>
+            </div>
+            <div class="card">
+                <h3>Best Tracking Score</h3>
+                <div class="value {'success' if best_score > 0.5 else 'warning' if best_score > 0 else 'error'}">{best_score:.3f}</div>
+                <div class="subtext">> 0.5 = strong tracking</div>
+            </div>
+            <div class="card">
+                <h3>Significant Heads</h3>
+                <div class="value">{len([h for h in top_differentiating if h.get('p_value', 1) < 0.05])}</div>
+                <div class="subtext">p < 0.05 for FB vs TB</div>
+            </div>
+            <div class="card">
+                <h3>Total Heads</h3>
+                <div class="value">{num_layers * num_heads}</div>
+                <div class="subtext">{num_layers} layers x {num_heads} heads</div>
+            </div>
+        </div>
+    """
+
+    # Attention-specific styles
+    attention_styles = """
+        <style>
+            .intro-box {
+                background: var(--bg-secondary);
+                border: 1px solid var(--border);
+                border-radius: 12px;
+                padding: 1.5rem;
+                margin-bottom: 2rem;
+            }
+
+            .intro-box h3 {
+                color: var(--accent);
+                margin-bottom: 0.5rem;
+            }
+
+            .config-panel, .sanity-panel {
+                background: var(--bg-tertiary);
+                border-radius: 8px;
+                padding: 1rem 1.5rem;
+                margin-bottom: 1rem;
+            }
+
+            .config-panel h3, .sanity-panel h3 {
+                font-size: 0.875rem;
+                color: var(--text-secondary);
+                margin-bottom: 0.75rem;
+            }
+
+            .config-grid {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 1.5rem;
+            }
+
+            .config-item {
+                display: flex;
+                flex-direction: column;
+            }
+
+            .config-label {
+                font-size: 0.75rem;
+                color: var(--text-secondary);
+                text-transform: uppercase;
+            }
+
+            .config-value {
+                font-weight: 600;
+                color: var(--text-primary);
+            }
+
+            .attention-section {
+                background: var(--bg-secondary);
+                border: 1px solid var(--border);
+                border-radius: 12px;
+                padding: 1.5rem;
+                margin-bottom: 2rem;
+            }
+
+            .attention-section h2 {
+                margin-bottom: 0.5rem;
+            }
+
+            .section-description {
+                color: var(--text-secondary);
+                margin-bottom: 1rem;
+                font-size: 0.9rem;
+            }
+
+            .success { color: var(--success); }
+            .warning { color: var(--warning); }
+            .error { color: var(--error); }
+
+            .badge.success { background: rgba(0, 186, 124, 0.2); color: var(--success); }
+            .badge.info { background: rgba(29, 155, 240, 0.2); color: var(--accent); }
+        </style>
+    """
+
+    content = f"""
+        {attention_styles}
+
+        <h1>Attention Analysis</h1>
+
+        <div class="intro-box">
+            <h3>What is Attention Analysis?</h3>
+            <p>Attention analysis examines which tokens the model attends to when answering Theory of Mind questions.
+            We measure attention from the <strong>question tokens</strong> (where the model forms its answer) to
+            <strong>belief tokens</strong> (where the protagonist's belief is stated) vs <strong>world tokens</strong>
+            (where the actual reality is stated).</p>
+            <p style="margin-top: 0.5rem;">A head with high <strong>belief tracking score</strong> attends more to what
+            the protagonist <em>believes</em> than to what is <em>actually true</em> - suggesting it may be involved
+            in perspective-taking.</p>
+        </div>
+
+        <p style="margin-bottom: 1rem;">
+            <strong>Model:</strong> {html_module.escape(model_name)} &nbsp;|&nbsp;
+            <strong>Timestamp:</strong> {html_module.escape(timestamp)}
+        </p>
+
+        {config_html}
+        {sanity_html}
+
+        {cards}
+
+        <div class="attention-section">
+            <h2>Top Belief-Tracking Heads</h2>
+            <p class="section-description">
+                {ATTENTION_EXPLANATIONS['belief_tracking_score']['description']}
+                <br><strong>Interpretation:</strong> {ATTENTION_EXPLANATIONS['belief_tracking_score']['interpretation']}
+            </p>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Rank</th>
+                        <th>Layer</th>
+                        <th>Head</th>
+                        <th title="log(belief_attn/world_attn) on FB tasks">Tracking Score</th>
+                        <th title="Mean attention to belief token on FB tasks">Belief Attn (FB)</th>
+                        <th title="Mean attention to world token on FB tasks">World Attn (FB)</th>
+                        <th title="Belief/World ratio">Ratio</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {''.join(tracking_rows) if tracking_rows else '<tr><td colspan="7">No data</td></tr>'}
+                </tbody>
+            </table>
+        </div>
+
+        <div class="attention-section">
+            <h2>Top Differentiating Heads (FB vs TB)</h2>
+            <p class="section-description">
+                {ATTENTION_EXPLANATIONS['differential_score']['description']}
+            </p>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Rank</th>
+                        <th>Layer</th>
+                        <th>Head</th>
+                        <th title="Belief attention (FB - TB)">Differential</th>
+                        <th>Belief Attn (FB)</th>
+                        <th>Belief Attn (TB)</th>
+                        <th title="t-test p-value">p-value</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {''.join(diff_rows) if diff_rows else '<tr><td colspan="7">No data</td></tr>'}
+                </tbody>
+            </table>
+        </div>
+
+        <div class="heatmap-container">
+            <h4>Layer Heatmap (Max Belief Tracking Score per Layer)</h4>
+            <p class="section-description">Green = positive (belief tracking), Red = negative (reality tracking)</p>
+            <div class="heatmap" style="grid-template-columns: repeat({num_layers}, 24px);">
+                {''.join(heatmap_cells)}
+            </div>
+            <div class="legend">
+                <span>Reality</span>
+                <div class="legend-gradient" style="background: linear-gradient(to right, hsl(0, 50%, 30%), hsl(0, 0%, 25%), hsl(120, 50%, 30%));"></div>
+                <span>Belief</span>
+            </div>
+        </div>
+    """
+
+    return render_page("Attention", content, "Attention", selected_model=selected_model)
+
+
 def render_api_stats(selected_model: Optional[str] = None) -> str:
     """Return JSON stats for API."""
     summary = dashboard.get_study_summary()
@@ -1490,6 +2073,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
             content_type = "text/html"
         elif path == "/probing":
             content = render_probing(selected_model)
+            content_type = "text/html"
+        elif path == "/probing/download/csv":
+            content = generate_probing_csv(selected_model)
+            if not content:
+                self.send_error(404, "No probing data available")
+                return
+            content_type = "text/csv"
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Disposition", "attachment; filename=probing_predictions.csv")
+            self.send_header("Content-Length", len(content.encode()))
+            self.end_headers()
+            self.wfile.write(content.encode())
+            return
+        elif path == "/attention":
+            content = render_attention(selected_model)
             content_type = "text/html"
         elif path == "/api/stats":
             content = render_api_stats(selected_model)

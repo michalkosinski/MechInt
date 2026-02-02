@@ -9,7 +9,7 @@ Response parsing and evaluation logic. Uses model_runner for inference.
 
 Usage:
     python -m src.behavioral_analysis
-    python -m src.behavioral_analysis --model "Qwen/Qwen2.5-0.5B-Instruct"
+    python -m src.behavioral_analysis --model "Qwen/Qwen2.5-0.5B"
     python -m src.behavioral_analysis --tasks-file tasks.json --batch-size 8
 """
 

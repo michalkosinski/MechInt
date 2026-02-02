@@ -684,7 +684,7 @@ if __name__ == "__main__":
     tasks = generate_tasks(num_families=1)
 
     # Load model
-    runner = ModelRunner("Qwen/Qwen2.5-0.5B-Instruct")
+    runner = ModelRunner("Qwen/Qwen2.5-0.5B")
 
     # Show model info
     info = runner.get_model_info()
