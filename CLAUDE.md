@@ -12,37 +12,33 @@ Behavioral study investigating Theory of Mind (ToM) in LLMs. Tests whether model
 # Install dependencies
 pip install -r requirements.txt
 
-# Run behavioral study
-python -m src.run_study
+# Run behavioral analysis (main command)
+python -m src.behavioral_analysis --model mistralai/Mistral-7B-v0.3 --tasks 100
 
-# Run with specific model
-python -m src.run_study --model "Qwen/Qwen2.5-3B"
+# Generate tasks
+python -m src.task_generator --families 500 --output tasks.json
+
+# Test model loading
+python -m src.model_runner --model mistralai/Mistral-7B-v0.3
 
 # Start dashboard (port 8016)
 nohup python server_watchdog.py > /tmp/MechInt_watchdog.log 2>&1 &
 
 # Stop server
 pkill -f "server_watchdog.py" && pkill -f "web_dashboard.py"
-
-# Run tests
-python -m pytest tests/ -v
-
-# Generate tasks (80 total: 10 families × 8 rows, outputs tasks.json + tasks.md)
-python -m src.task_generator
 ```
 
 ## Architecture
 
 ### Core Pipeline
-1. **Task Generation** (`src/task_generator.py`) - Creates false/true belief tasks with explicit belief statements
-2. **Model Execution** (`src/model_runner.py`) - Runs HuggingFace model for behavioral analysis
+
+1. **Task Generation** (`src/task_generator.py`) - Creates false/true belief tasks
+2. **Behavioral Analysis** (`src/behavioral_analysis.py`) - Runs inference and scores responses
 3. **Dashboard** (`web_dashboard.py`) - Visualizes results on port 8016
 
 ### Data Flow
 ```
-tasks.json → model_runner → web_dashboard
-                 ↓
-         results/behavioral/
+tasks.json → behavioral_analysis → results/behavioral/ → web_dashboard
 ```
 
 ### Task Format
@@ -54,7 +50,7 @@ Question: "Where will Anna look for the ball?"
 
 ## Key Files
 
-- `src/task_generator.py` - ToMTask dataclass, 8-row truth table (tb1-tb4, fb1-fb4), 50/50 TB/FB
+- `src/task_generator.py` - ToMTask dataclass, 4 variants per family (tb1-tb2, fb1-fb2), 50/50 TB/FB
 - `src/model_runner.py` - HF model loading for inference
 - `src/behavioral_analysis.py` - Response parsing and accuracy metrics
 - `web_dashboard.py` - HTTP server with visualizations

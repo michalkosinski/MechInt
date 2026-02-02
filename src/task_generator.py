@@ -5,13 +5,14 @@
 """
 Task generator for Theory of Mind experiments.
 
-8-row truth table design per family (agent, obj, C1, C2):
-- order: (C1,C2) or (C2,C1) in preamble
-- world: C1 or C2 (where object actually is)
-- belief: C1 or C2 (where agent thinks it is)
+Unexpected transfer paradigm (Sally-Anne style):
+- Protagonist puts object in container, then leaves (or sees move, then leaves)
+- Observer moves object to different container
+- Protagonist returns
 
-TB: world == belief (tb1-tb4)
-FB: world != belief (fb1-fb4)
+4 variants per family:
+- tb1/tb2: true belief (protagonist sees move before leaving)
+- fb1/fb2: false belief (protagonist leaves before move)
 """
 
 import json
@@ -34,18 +35,6 @@ NAMES = [
     "Yuki", "Zoe", "Alex", "Beth", "Chris", "Dana", "Emma", "Felix"
 ]
 
-# (suffix, order_idx, world_idx, belief_idx)
-ROWS = [
-    ("tb1", (1, 2), 1, 1),
-    ("tb2", (2, 1), 1, 1),
-    ("tb3", (1, 2), 2, 2),
-    ("tb4", (2, 1), 2, 2),
-    ("fb1", (1, 2), 1, 2),
-    ("fb2", (2, 1), 1, 2),
-    ("fb3", (1, 2), 2, 1),
-    ("fb4", (2, 1), 2, 1),
-]
-
 
 def article(word: str) -> str:
     return "an" if word[0].lower() in "aeiou" else "a"
@@ -53,89 +42,91 @@ def article(word: str) -> str:
 
 @dataclass
 class ToMTask:
-    task_id: str                # e.g., "f001_tb3"
-    family_id: str              # e.g., "f001"
-    task_type: str              # "true_belief" or "false_belief"
-    full_prompt: str
-    expected_answer: str        # always = belief
+    task_id: str
+    family_id: str
+    task_type: str           # "true_belief" or "false_belief"
+    narrative: str
     protagonist: str
+    observer: str
     obj: str
-    c1: str                     # canonical "first" container
-    c2: str                     # canonical "second" container
-    order: tuple[str, str]      # (first_mentioned, second_mentioned) in preamble
-    world: str                  # reality location
-    belief: str                 # belief location
+    initial_location: str    # where protagonist puts object
+    final_location: str      # where observer moves it (= reality)
+    protagonist_belief: str  # initial_location for FB, final_location for TB
 
 
-def make_task(family_id: str, agent: str, obj: str, c1: str, c2: str,
-              row_def: tuple) -> ToMTask:
-    """Create a single task from a row definition."""
-    suffix, order_idx, world_idx, belief_idx = row_def
-    containers = {1: c1, 2: c2}
+def make_task(family_id: str, protagonist: str, observer: str,
+              obj: str, initial: str, final: str, is_true_belief: bool,
+              variant: int) -> ToMTask:
+    """Create a single task."""
+    suffix = f"tb{variant}" if is_true_belief else f"fb{variant}"
 
-    order = (containers[order_idx[0]], containers[order_idx[1]])
-    world = containers[world_idx]
-    belief = containers[belief_idx]
-    task_type = "true_belief" if suffix.startswith("tb") else "false_belief"
+    intro = f"In a room there are {protagonist}, {observer}, {article(initial)} {initial}, and {article(final)} {final}."
+    put = f"{protagonist} puts {article(obj)} {obj} in the {initial}."
+    leave = f"{protagonist} leaves the room."
+    move = f"{observer} moves the {obj} to the {final}."
+    returns = f"{protagonist} returns."
 
-    prompt = (
-        f"There is {article(order[0])} {order[0]} and {article(order[1])} {order[1]}. "
-        f"{article(obj).capitalize()} {obj} is in the {world}. "
-        f"{agent} believes the {obj} is in the {belief}. "
-        f"{agent} will look for the {obj} in the"
-    )
+    if is_true_belief:
+        narrative = f"{intro} {put} {move} {leave} {returns}"
+        belief = final
+    else:
+        narrative = f"{intro} {put} {leave} {move} {returns}"
+        belief = initial
 
     return ToMTask(
         task_id=f"{family_id}_{suffix}",
         family_id=family_id,
-        task_type=task_type,
-        full_prompt=prompt,
-        expected_answer=belief,
-        protagonist=agent,
+        task_type="true_belief" if is_true_belief else "false_belief",
+        narrative=narrative,
+        protagonist=protagonist,
+        observer=observer,
         obj=obj,
-        c1=c1,
-        c2=c2,
-        order=order,
-        world=world,
-        belief=belief,
+        initial_location=initial,
+        final_location=final,
+        protagonist_belief=belief,
     )
 
 
-def generate_family(family_id: str, agent: str, obj: str, c1: str, c2: str) -> list[ToMTask]:
-    """Generate all 8 rows for one family."""
-    return [make_task(family_id, agent, obj, c1, c2, row) for row in ROWS]
+def generate_family(family_id: str, protagonist: str, observer: str,
+                    obj: str, c1: str, c2: str) -> list[ToMTask]:
+    """Generate 4 variants for one family."""
+    tasks = []
+    for is_tb in [True, False]:
+        for variant, (init, fin) in enumerate([(c1, c2), (c2, c1)], 1):
+            tasks.append(make_task(family_id, protagonist, observer, obj, init, fin, is_tb, variant))
+    return tasks
 
 
-def generate_tasks(num_families: int = 100, seed: int = 42) -> list[ToMTask]:
-    """Generate num_families × 8 tasks."""
+def generate_tasks(num_families: int = 500, seed: int = 42) -> list[ToMTask]:
+    """Generate num_families × 4 tasks."""
     random.seed(seed)
     tasks = []
-    used: set[tuple[str, str, str, str]] = set()
+    used: set[tuple[str, str, str, str, str]] = set()
 
     for i in range(num_families):
         while True:
             c1, c2 = random.sample(CONTAINERS, 2)
-            agent = random.choice(NAMES)
+            protagonist, observer = random.sample(NAMES, 2)
             obj = random.choice(OBJECTS)
-            config = (agent, obj, c1, c2)
+            config = (protagonist, observer, obj, c1, c2)
             if config not in used:
                 used.add(config)
                 break
 
         family_id = f"f{i + 1:03d}"
-        tasks.extend(generate_family(family_id, agent, obj, c1, c2))
+        tasks.extend(generate_family(family_id, protagonist, observer, obj, c1, c2))
 
-    random.shuffle(tasks)
     return tasks
 
 
 def save_tasks(tasks: list[ToMTask], path: Path) -> None:
     """Save tasks to JSON and markdown files."""
+    tasks = sorted(tasks, key=lambda t: t.task_id)
     families = {t.family_id for t in tasks}
     tb_count = sum(1 for t in tasks if t.task_type == "true_belief")
 
     data = {
-        "version": "6.0",
+        "version": "7.0",
         "num_tasks": len(tasks),
         "num_families": len(families),
         "task_type_counts": {"true_belief": tb_count, "false_belief": len(tasks) - tb_count},
@@ -144,34 +135,28 @@ def save_tasks(tasks: list[ToMTask], path: Path) -> None:
 
     Path(path).write_text(json.dumps(data, indent=2))
 
-    # Save markdown
     md_path = path.with_suffix(".md")
     lines = [f"# ToM Tasks ({len(tasks)} total, {len(families)} families)\n"]
     for i, task in enumerate(tasks, 1):
-        lines.append(
-            f"{i}. **{task.task_id}** ({task.task_type}): "
-            f"{task.full_prompt}**{task.expected_answer}**\n"
-        )
+        lines.append(f"{i}. **{task.task_id}** ({task.task_type}): {task.narrative}\n")
     md_path.write_text("\n".join(lines))
 
 
 def load_tasks(path: Path) -> list[ToMTask]:
     """Load tasks from JSON file."""
     data = json.loads(Path(path).read_text())
-    tasks = []
-    for t in data["tasks"]:
-        t["order"] = tuple(t["order"])
-        tasks.append(ToMTask(**t))
-    return tasks
+    return [ToMTask(**t) for t in data["tasks"]]
 
 
 if __name__ == "__main__":
-    tasks = generate_tasks()
-    output_path = Path(__file__).parent.parent / "tasks.json"
-    save_tasks(tasks, output_path)
+    import argparse
+    parser = argparse.ArgumentParser(description="Generate ToM tasks")
+    parser.add_argument("--families", type=int, default=500, help="Number of families (4 tasks each)")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--output", default="tasks.json", help="Output file path")
+    args = parser.parse_args()
 
-    tb = sum(1 for t in tasks if t.task_type == "true_belief")
-    fb = len(tasks) - tb
-    print(f"Generated {len(tasks)} tasks ({len(tasks)//8} families × 8)")
-    print(f"  Types: {tb} true_belief, {fb} false_belief")
-    print(f"\nSaved to: {output_path} and {output_path.with_suffix('.md')}")
+    tasks = generate_tasks(num_families=args.families, seed=args.seed)
+    save_tasks(tasks, Path(args.output))
+    print(f"Generated {len(tasks)} tasks ({args.families} families) -> {args.output}")
+

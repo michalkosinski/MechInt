@@ -103,6 +103,79 @@ class Dashboard:
                 results.append(data)
         return results
 
+    def get_behavioral_results_by_task(self) -> tuple:
+        """Load all behavioral files and group by task_id.
+
+        Returns:
+            (results_by_task, summaries_by_question_type)
+
+        results_by_task = {
+            "f001_fb1": {
+                "reality": {...detail...},
+                "protagonist": {...detail...},
+                "observer": {...detail...}
+            }
+        }
+        """
+        behavioral_dir = self.results_dir / "behavioral"
+        results_by_task: Dict[str, Dict] = {}
+        summaries: Dict[str, Dict] = {}
+
+        if not behavioral_dir.exists():
+            return results_by_task, summaries
+
+        # Get model slug for filename matching
+        model_slug = self.model.replace("/", "_") if self.model else None
+
+        for question_type in ["reality", "protagonist", "observer"]:
+            # Find matching file for this question type
+            if model_slug:
+                pattern = f"{model_slug}_{question_type}.json"
+            else:
+                pattern = f"*_{question_type}.json"
+
+            for f in behavioral_dir.glob(pattern):
+                try:
+                    data = json.loads(f.read_text())
+                    details = data.get("details", [])
+                    stored_summary = data.get("summary", {})
+
+                    # Compute summary from details instead of using stored summary
+                    total_tasks = len(details)
+                    correct = sum(1 for d in details if d.get("is_correct", False))
+                    uncertain = sum(1 for d in details if d.get("is_uncertain", False))
+
+                    # Compute FB/TB accuracy
+                    fb_tasks = [d for d in details if d.get("task_type") == "false_belief"]
+                    tb_tasks = [d for d in details if d.get("task_type") == "true_belief"]
+                    fb_correct = sum(1 for d in fb_tasks if d.get("is_correct", False))
+                    tb_correct = sum(1 for d in tb_tasks if d.get("is_correct", False))
+
+                    summaries[question_type] = {
+                        "model_name": stored_summary.get("model_name", ""),
+                        "question_type": question_type,
+                        "timestamp": stored_summary.get("timestamp", ""),
+                        "total_tasks": total_tasks,
+                        "correct": correct,
+                        "accuracy": correct / total_tasks if total_tasks > 0 else 0,
+                        "uncertain": uncertain,
+                        "false_belief_accuracy": fb_correct / len(fb_tasks) if fb_tasks else 0,
+                        "true_belief_accuracy": tb_correct / len(tb_tasks) if tb_tasks else 0,
+                    }
+
+                    for detail in details:
+                        task_id = detail.get("task_id")
+                        if task_id:
+                            if task_id not in results_by_task:
+                                results_by_task[task_id] = {}
+                            results_by_task[task_id][question_type] = detail
+                except (json.JSONDecodeError, KeyError):
+                    continue
+                # Only process first matching file per question type
+                break
+
+        return results_by_task, summaries
+
     def get_tasks(self) -> List[Dict]:
         """Load tasks."""
         if TASKS_FILE.exists():
@@ -554,381 +627,978 @@ def render_page(title: str, content: str, nav_active: str = "", selected_model: 
 
 
 def render_overview(selected_model: Optional[str] = None) -> str:
-    """Render the overview page."""
-    behavioral = dashboard.get_behavioral_results()
+    """Render the overview page with metrics from all question types."""
+    dash = get_dashboard(selected_model)
+    results_by_task, summaries = dash.get_behavioral_results_by_task()
 
-    if not behavioral:
+    if not summaries:
         return render_page("Overview", """
             <h1>Overview</h1>
             <div class="empty-state">
                 <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                 </svg>
-                <p>No study results found.</p>
-                <p>Run <code>python -m src.run_study</code> to generate results.</p>
+                <p>No behavioral results found.</p>
+                <p>Run <code>python -m src.behavioral_analysis</code> to generate results.</p>
             </div>
         """, "Overview", selected_model=selected_model)
 
-    # Get stats from behavioral results (first file if multiple)
-    behavioral_data = behavioral[0] if behavioral else {}
-    summary = behavioral_data.get("summary", {})
-    model_name = behavioral_data.get("model", selected_model or "Unknown")
-    timestamp = behavioral_data.get("timestamp", "N/A")
+    # Get model info from any available summary
+    first_summary = next(iter(summaries.values()), {})
+    model_name = first_summary.get("model_name", selected_model or "Unknown")
+    timestamp = first_summary.get("timestamp", "N/A")
+    total_tasks = first_summary.get("total_tasks", len(results_by_task))
 
-    # Build cards
-    cards = []
+    # Calculate overall accuracy across all question types
+    total_correct = 0
+    total_count = 0
+    total_uncertain = 0
 
-    acc = summary.get("overall_accuracy", 0) * 100
-    acc_class = "success" if acc >= 70 else "warning" if acc >= 50 else "error"
-    cards.append(f"""
+    for qt, summary in summaries.items():
+        total_correct += summary.get("correct", 0)
+        total_count += summary.get("total_tasks", 0)
+        total_uncertain += summary.get("uncertain", 0)
+
+    overall_acc = (total_correct / total_count * 100) if total_count > 0 else 0
+    acc_class = "success" if overall_acc >= 70 else "warning" if overall_acc >= 50 else "error"
+
+    # Build Row 1: Overall metrics cards
+    row1_cards = []
+
+    row1_cards.append(f"""
         <div class="card">
             <h3>Overall Accuracy</h3>
-            <div class="value {acc_class}">{acc:.1f}%</div>
-            <div class="subtext">{summary.get('num_tasks', 0)} tasks</div>
+            <div class="value {acc_class}">{overall_acc:.1f}%</div>
+            <div class="subtext">Across all question types</div>
         </div>
     """)
 
-    fb_acc = summary.get("false_belief_accuracy", 0) * 100
-    cards.append(f"""
+    # Get protagonist summary for FB/TB breakdown (most relevant for ToM)
+    prot_summary = summaries.get("protagonist", {})
+    fb_acc = prot_summary.get("false_belief_accuracy", 0) * 100
+    fb_class = "success" if fb_acc >= 70 else "warning" if fb_acc >= 50 else "error"
+    row1_cards.append(f"""
         <div class="card">
-            <h3>False Belief Accuracy</h3>
-            <div class="value">{fb_acc:.1f}%</div>
-            <div class="subtext">Tests belief vs reality</div>
+            <h3>False Belief (Protagonist)</h3>
+            <div class="value {fb_class}">{fb_acc:.1f}%</div>
+            <div class="subtext">Key ToM metric</div>
         </div>
     """)
 
-    tb_acc = summary.get("true_belief_accuracy", 0) * 100
-    cards.append(f"""
+    tb_acc = prot_summary.get("true_belief_accuracy", 0) * 100
+    tb_class = "success" if tb_acc >= 70 else "warning" if tb_acc >= 50 else "error"
+    row1_cards.append(f"""
         <div class="card">
-            <h3>True Belief Accuracy</h3>
-            <div class="value">{tb_acc:.1f}%</div>
+            <h3>True Belief (Protagonist)</h3>
+            <div class="value {tb_class}">{tb_acc:.1f}%</div>
             <div class="subtext">Control condition</div>
         </div>
     """)
 
-    num_uncertain = summary.get("num_uncertain", 0)
-    if num_uncertain > 0:
-        cards.append(f"""
+    row1_cards.append(f"""
+        <div class="card">
+            <h3>Tasks Analyzed</h3>
+            <div class="value">{total_tasks}</div>
+            <div class="subtext">{len(summaries)} question types</div>
+        </div>
+    """)
+
+    # Build Row 2: Question type breakdown
+    row2_cards = []
+    question_labels = {
+        "reality": ("Reality", "Where is the object?"),
+        "protagonist": ("Protagonist", "Where will they look?"),
+        "observer": ("Observer", "Where will observer look?")
+    }
+
+    for qt in ["reality", "protagonist", "observer"]:
+        summary = summaries.get(qt, {})
+        if summary:
+            acc = summary.get("accuracy", 0) * 100
+            acc_class = "success" if acc >= 70 else "warning" if acc >= 50 else "error"
+            label, desc = question_labels.get(qt, (qt.title(), ""))
+            row2_cards.append(f"""
+                <div class="card">
+                    <h3>{label} Question</h3>
+                    <div class="value {acc_class}">{acc:.1f}%</div>
+                    <div class="subtext">{desc}</div>
+                </div>
+            """)
+
+    if total_uncertain > 0:
+        row2_cards.append(f"""
             <div class="card">
                 <h3>Uncertain Responses</h3>
-                <div class="value warning">{num_uncertain}</div>
+                <div class="value warning">{total_uncertain}</div>
                 <div class="subtext">Could not parse answer</div>
             </div>
         """)
 
-    # Model info
+    # Build comparison chart (FB vs TB for each question type)
+    chart_rows = []
+    for qt in ["reality", "protagonist", "observer"]:
+        summary = summaries.get(qt, {})
+        if summary:
+            fb = summary.get("false_belief_accuracy", 0) * 100
+            tb = summary.get("true_belief_accuracy", 0) * 100
+            label = question_labels.get(qt, (qt.title(), ""))[0]
+            chart_rows.append(f"""
+                <div class="chart-row">
+                    <span class="chart-label">{label}</span>
+                    <div class="chart-bars">
+                        <div class="bar-group">
+                            <span class="bar-type">FB</span>
+                            <div class="bar fb" style="width: {fb}%"><span>{fb:.0f}%</span></div>
+                        </div>
+                        <div class="bar-group">
+                            <span class="bar-type">TB</span>
+                            <div class="bar tb" style="width: {tb}%"><span>{tb:.0f}%</span></div>
+                        </div>
+                    </div>
+                </div>
+            """)
+
+    comparison_chart = f"""
+        <div class="comparison-section">
+            <h2>Performance by Question Type</h2>
+            <div class="comparison-chart">
+                {''.join(chart_rows)}
+            </div>
+            <div class="chart-legend">
+                <span class="legend-item"><span class="legend-dot fb"></span> False Belief</span>
+                <span class="legend-item"><span class="legend-dot tb"></span> True Belief</span>
+            </div>
+        </div>
+    """ if chart_rows else ""
+
+    # Model info table
     model_info = f"""
         <h2>Study Configuration</h2>
         <table>
-            <tr><th>Model</th><td>{model_name}</td></tr>
-            <tr><th>Timestamp</th><td>{timestamp}</td></tr>
-            <tr><th>Tasks</th><td>{summary.get('num_tasks', 0)}</td></tr>
+            <tr><th>Model</th><td>{html_module.escape(str(model_name))}</td></tr>
+            <tr><th>Timestamp</th><td>{html_module.escape(str(timestamp))}</td></tr>
+            <tr><th>Total Tasks</th><td>{total_tasks}</td></tr>
+            <tr><th>Question Types</th><td>{', '.join(summaries.keys())}</td></tr>
         </table>
     """
 
+    # Custom CSS for overview
+    overview_css = """
+        <style>
+            .comparison-section {
+                background: var(--bg-secondary);
+                border-radius: 12px;
+                padding: 1.5rem;
+                border: 1px solid var(--border);
+                margin-bottom: 2rem;
+            }
+            .comparison-section h2 {
+                margin: 0 0 1rem 0;
+                font-size: 1rem;
+                color: var(--text-secondary);
+            }
+            .comparison-chart {
+                display: flex;
+                flex-direction: column;
+                gap: 1rem;
+            }
+            .chart-row {
+                display: grid;
+                grid-template-columns: 100px 1fr;
+                gap: 1rem;
+                align-items: center;
+            }
+            .chart-label {
+                color: var(--text-secondary);
+                font-weight: 500;
+                font-size: 0.875rem;
+            }
+            .chart-bars {
+                display: flex;
+                flex-direction: column;
+                gap: 0.25rem;
+            }
+            .bar-group {
+                display: flex;
+                align-items: center;
+                gap: 0.5rem;
+            }
+            .bar-type {
+                width: 24px;
+                font-size: 0.7rem;
+                color: var(--text-secondary);
+            }
+            .bar {
+                height: 24px;
+                border-radius: 4px;
+                display: flex;
+                align-items: center;
+                justify-content: flex-end;
+                padding-right: 0.5rem;
+                color: white;
+                font-size: 0.75rem;
+                font-weight: 600;
+                min-width: 40px;
+                transition: width 0.3s ease;
+            }
+            .bar.fb { background: var(--accent); }
+            .bar.tb { background: var(--success); }
+            .chart-legend {
+                display: flex;
+                gap: 1.5rem;
+                margin-top: 1rem;
+                padding-top: 1rem;
+                border-top: 1px solid var(--border);
+            }
+            .legend-item {
+                display: flex;
+                align-items: center;
+                gap: 0.5rem;
+                font-size: 0.875rem;
+                color: var(--text-secondary);
+            }
+            .legend-dot {
+                width: 12px;
+                height: 12px;
+                border-radius: 3px;
+            }
+            .legend-dot.fb { background: var(--accent); }
+            .legend-dot.tb { background: var(--success); }
+        </style>
+    """
+
     content = f"""
+        {overview_css}
         <h1>Study Overview</h1>
         <div class="card-grid">
-            {''.join(cards)}
+            {''.join(row1_cards)}
         </div>
+        <div class="card-grid">
+            {''.join(row2_cards)}
+        </div>
+        {comparison_chart}
         {model_info}
     """
 
     return render_page("Overview", content, "Overview", selected_model=selected_model)
 
 def render_tasks(selected_model: Optional[str] = None) -> str:
-    """Render the tasks page with sorting, filtering, and parsed responses."""
-    tasks = dashboard.get_tasks()
-    behavioral = dashboard.get_behavioral_results()
+    """Render the tasks page with card layout showing all 3 question types per task."""
+    dash = get_dashboard(selected_model)
+    tasks = dash.get_tasks()
+    results_by_task, _ = dash.get_behavioral_results_by_task()
+
+    # Filter to only show tasks with results for the selected model
+    if results_by_task:
+        tasks = [t for t in tasks if t.get("task_id") in results_by_task]
 
     if not tasks:
         return render_page("Tasks", """
             <h1>Tasks</h1>
             <div class="empty-state">
                 <p>No tasks found.</p>
-                <p>Run the study to generate tasks.</p>
+                <p>Run <code>python -m src.task_generator</code> to generate tasks.</p>
             </div>
         """, "Tasks", selected_model=selected_model)
 
-    # Build results lookup
-    results_by_id = {}
-    for b in behavioral:
-        for detail in b.get("details", []):
-            results_by_id[detail["task_id"]] = detail
-
-    # Sort tasks by ID (natural sort)
+    # Sort tasks by ID (natural sort for f001_fb1 format)
     def sort_key(t):
         task_id = t.get("task_id", "")
-        # Extract prefix, number, and suffix (e.g., "tb_1r" -> ("tb", 1, "r"))
-        match = re.match(r"([a-z]+)_(\d+)(r?)", task_id)
+        # Extract family number and variant (e.g., "f001_fb1" -> ("f", 1, "fb1"))
+        match = re.match(r"f(\d+)_([a-z]+)(\d+)", task_id)
         if match:
-            return (match.group(1), int(match.group(2)), match.group(3))
-        return (task_id, 0, "")
+            return (int(match.group(1)), match.group(2), int(match.group(3)))
+        return (0, task_id, 0)
 
     tasks = sorted(tasks, key=sort_key)
 
-    rows = []
+    # Question type info
+    question_types = ["reality", "protagonist", "observer"]
+    question_labels = {
+        "reality": "Reality",
+        "protagonist": "Protagonist",
+        "observer": "Observer"
+    }
+
+    # Build cards
+    cards = []
+    total_with_errors = 0
+
     for idx, task in enumerate(tasks):
         task_id = task.get("task_id", "")
         task_type = task.get("task_type", "")
-        prompt = task.get("full_prompt", "")
-        expected = task.get("expected_answer", "")
-        result = results_by_id.get(task_id, {})
+        family_id = task.get("family_id", "")
+        narrative = task.get("narrative", "")
 
-        if result:
-            raw = result.get("response", "N/A")
-            parsed = result.get("parsed_response", raw)
-            is_correct = result.get("is_correct", False)
-            is_uncertain = result.get("is_uncertain", False)
-            if is_uncertain:
-                badge = '<span class="badge warning">?</span>'
-            else:
-                badge = f'<span class="badge {"success" if is_correct else "error"}">{"✓" if is_correct else "✗"}</span>'
-        else:
-            raw = "-"
-            parsed = "-"
-            is_correct = False
-            is_uncertain = False
-            badge = '<span class="badge info">-</span>'
+        # Get task details for generating questions
+        protagonist_name = task.get("protagonist", "")
+        observer_name = task.get("observer", "")
+        obj = task.get("obj", "")
+        protagonist_belief = task.get("protagonist_belief", "")
+        final_location = task.get("final_location", "")
 
-        # Type badge with color coding
-        type_colors = {
-            "true_belief": "success",
-            "false_belief": "error",
-            "mismatch": "warning",
-            "negation_trap": "info",
-            "belief_overwrite": "purple"
+        # Generate question text from task data (last sentence of prompt)
+        questions = {
+            "reality": f"The {obj} is in the",
+            "protagonist": f"{protagonist_name} will look for the {obj} in the",
+            "observer": f"{observer_name} will look for the {obj} in the"
         }
-        base_type = task_type.replace("_reversed", "")
-        color = type_colors.get(base_type, "info")
-        type_short = task_type.replace("_reversed", " ↔").replace("_", " ").title()
-        type_badge = f'<span class="badge {color}">{type_short}</span>'
 
-        # Escape for HTML
-        raw_escaped = html_module.escape(raw)
-        parsed_escaped = html_module.escape(parsed)
-        prompt_escaped = html_module.escape(prompt)
-        expected_escaped = html_module.escape(expected)
+        expected_answers = {
+            "reality": final_location,
+            "protagonist": protagonist_belief,
+            "observer": final_location
+        }
 
-        rows.append(f"""
-            <tr data-type="{base_type}" data-correct="{'true' if is_correct else 'false'}" data-uncertain="{'true' if is_uncertain else 'false'}" data-id="{task_id}">
-                <td class="col-id">{task_id}</td>
-                <td class="col-type">{type_badge}</td>
-                <td class="col-prompt"><code title="{prompt_escaped}">{prompt_escaped[:80]}{'...' if len(prompt) > 80 else ''}</code></td>
-                <td class="col-expected">{expected_escaped}</td>
-                <td class="col-raw"><code>{raw_escaped}</code></td>
-                <td class="col-parsed"><strong>{parsed_escaped}</strong></td>
-                <td class="col-result">{badge}</td>
-                <td class="col-expand">
-                    <button class="btn-expand" onclick="toggleDetails({idx})">▶</button>
-                </td>
-            </tr>
-            <tr class="details-row" id="details-{idx}" style="display:none;">
-                <td colspan="8">
-                    <div class="details-content">
-                        <div class="detail-section">
-                            <strong>Full Prompt:</strong>
-                            <pre>{prompt_escaped}</pre>
+        # Get results for this task
+        task_results = results_by_task.get(task_id, {})
+
+        # Determine card status
+        has_any_result = bool(task_results)
+        error_count = 0
+        status_dots = []
+        result_rows = []
+
+        for qt in question_types:
+            result = task_results.get(qt)
+            expected = expected_answers.get(qt, "")
+
+            if result:
+                is_correct = result.get("is_correct", False)
+                is_uncertain = result.get("is_uncertain", False)
+                parsed = result.get("parsed_response", "")
+                raw_response = result.get("response", "")
+                full_prompt = result.get("prompt", "")
+
+                # Extract question (last sentence after "returns.")
+                if "returns." in full_prompt:
+                    question_text = full_prompt.split("returns.")[-1].strip()
+                else:
+                    question_text = full_prompt.split(".")[-1].strip() if "." in full_prompt else full_prompt
+
+                if is_uncertain:
+                    status_class = "uncertain"
+                    status_symbol = "?"
+                    error_count += 1
+                elif is_correct:
+                    status_class = "correct"
+                    status_symbol = "✓"
+                else:
+                    status_class = "incorrect"
+                    status_symbol = "✗"
+                    error_count += 1
+            else:
+                # No result for this question type - use generated question
+                status_class = "missing"
+                status_symbol = "—"
+                parsed = "—"
+                raw_response = ""
+                full_prompt = ""
+                question_text = questions.get(qt, "")
+
+            status_dots.append(f'<span class="status-dot {status_class}" title="{question_labels[qt]}: {status_class}"></span>')
+
+            # Truncate raw response for display
+            raw_display = raw_response[:40] + "..." if len(raw_response) > 40 else raw_response
+
+            row_id = f"{task_id}_{qt}"
+            result_rows.append(f"""
+                <div class="result-row" data-row-id="{row_id}">
+                    <div class="result-main">
+                        <span class="result-label">{question_labels[qt]}</span>
+                        <span class="result-prompt">{html_module.escape(question_text)}</span>
+                        <span class="result-expected">{html_module.escape(expected)}</span>
+                        <span class="result-parsed {status_class}">{html_module.escape(parsed)}</span>
+                        <span class="result-raw" title="{html_module.escape(raw_response)}">{html_module.escape(raw_display) if raw_response else '—'}</span>
+                        <span class="result-status {status_class}">{status_symbol}</span>
+                        <button class="btn-row-toggle" onclick="toggleRowDetails('{row_id}')" {'disabled' if not result else ''}>▶</button>
+                    </div>
+                    <div class="result-details" id="row-details-{row_id}" style="display: none;">
+                        <div class="detail-item">
+                            <span class="detail-label">Full Prompt:</span>
+                            <code class="detail-value">{html_module.escape(full_prompt) if full_prompt else '—'}</code>
                         </div>
-                        <div class="detail-section">
-                            <strong>Full Response (raw):</strong>
-                            <pre>{raw_escaped}</pre>
-                        </div>
-                        <div class="detail-section">
-                            <strong>Expected:</strong> {expected_escaped} |
-                            <strong>Parsed:</strong> {parsed_escaped} |
-                            <strong>Match:</strong> {parsed.lower() == expected.lower()}
+                        <div class="detail-item">
+                            <span class="detail-label">Raw Response:</span>
+                            <code class="detail-value">{html_module.escape(raw_response) if raw_response else '—'}</code>
                         </div>
                     </div>
-                </td>
-            </tr>
+                </div>
+            """)
+
+        if error_count > 0:
+            total_with_errors += 1
+
+        # Card status class
+        if not has_any_result:
+            card_status = "no-results"
+        elif error_count == 0:
+            card_status = "all-correct"
+        else:
+            card_status = "has-error"
+
+        # Type badge
+        type_class = "tb" if task_type == "true_belief" else "fb"
+        type_label = "True Belief" if task_type == "true_belief" else "False Belief"
+
+        # Build expanded details
+        details_sections = []
+        for qt in question_types:
+            result = task_results.get(qt)
+            if result:
+                prompt = result.get("prompt", "")
+                raw_response = result.get("response", "")
+                parsed = result.get("parsed_response", "")
+                expected = expected_answers.get(qt, "")
+                is_correct = result.get("is_correct", False)
+
+                details_sections.append(f"""
+                    <div class="detail-question">
+                        <h4>{question_labels[qt]} Question</h4>
+                        <div class="detail-prompt">{html_module.escape(prompt)}</div>
+                        <div class="detail-response">
+                            <span class="response-label">Response:</span>
+                            <code>{html_module.escape(raw_response)}</code>
+                        </div>
+                        <div class="detail-comparison">
+                            <span>Parsed: <strong>{html_module.escape(parsed)}</strong></span>
+                            <span>Expected: <strong>{html_module.escape(expected)}</strong></span>
+                            <span class="{'correct' if is_correct else 'incorrect'}">{'✓ Match' if is_correct else '✗ Mismatch'}</span>
+                        </div>
+                    </div>
+                """)
+
+        # Data attributes for filtering
+        protagonist_result = task_results.get("protagonist", {})
+        reality_result = task_results.get("reality", {})
+
+        cards.append(f"""
+            <div class="task-card {card_status}"
+                 data-task-id="{task_id}"
+                 data-family-id="{family_id}"
+                 data-task-type="{task_type}"
+                 data-status="{card_status}"
+                 data-error-count="{error_count}"
+                 data-protagonist-correct="{'true' if protagonist_result.get('is_correct') else 'false'}"
+                 data-reality-correct="{'true' if reality_result.get('is_correct') else 'false'}">
+                <div class="card-header">
+                    <div class="card-meta">
+                        <span class="task-id">{task_id}</span>
+                        <span class="type-badge {type_class}">{type_label}</span>
+                    </div>
+                    <div class="card-status">
+                        {''.join(status_dots)}
+                        <button class="btn-toggle" onclick="toggleCard('{task_id}')">▶</button>
+                    </div>
+                </div>
+                <div class="card-narrative">{html_module.escape(narrative)}</div>
+                <div class="results-grid">
+                    <div class="results-header">
+                        <span></span>
+                        <span>Question</span>
+                        <span>Expected</span>
+                        <span>Parsed</span>
+                        <span>Raw Response</span>
+                        <span></span>
+                        <span></span>
+                    </div>
+                    {''.join(result_rows)}
+                </div>
+                <div class="card-details" id="details-{task_id}" style="display: none;">
+                    <div class="detail-narrative">
+                        <h4>Full Narrative</h4>
+                        <p>{html_module.escape(narrative)}</p>
+                    </div>
+                    {''.join(details_sections)}
+                </div>
+            </div>
         """)
 
-    # Count stats
     total = len(tasks)
 
-    content = f"""
-        <h1>Tasks ({total})</h1>
+    # CSS for task cards
+    tasks_css = """
+        <style>
+            .tasks-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 1.5rem;
+                flex-wrap: wrap;
+                gap: 1rem;
+            }
+            .tasks-header h1 {
+                margin: 0;
+            }
+            .tasks-stats {
+                display: flex;
+                gap: 1rem;
+                font-size: 0.875rem;
+                color: var(--text-secondary);
+            }
+            .tasks-stats span {
+                padding: 0.25rem 0.75rem;
+                background: var(--bg-secondary);
+                border-radius: 9999px;
+            }
+            .filters {
+                display: flex;
+                gap: 1rem;
+                flex-wrap: wrap;
+                margin-bottom: 1.5rem;
+                padding: 1rem;
+                background: var(--bg-secondary);
+                border-radius: 12px;
+                border: 1px solid var(--border);
+            }
+            .filter-group {
+                display: flex;
+                align-items: center;
+                gap: 0.5rem;
+            }
+            .filter-group label {
+                color: var(--text-secondary);
+                font-size: 0.875rem;
+            }
+            .filter-group select, .filter-group input {
+                padding: 0.5rem 0.75rem;
+                border: 1px solid var(--border);
+                border-radius: 6px;
+                background: var(--bg-tertiary);
+                color: var(--text-primary);
+                font-size: 0.875rem;
+            }
+            .filter-group select:focus, .filter-group input:focus {
+                outline: none;
+                border-color: var(--accent);
+            }
+            .filter-group input {
+                width: 200px;
+            }
+            .btn-reset {
+                padding: 0.5rem 1rem;
+                background: var(--bg-tertiary);
+                border: 1px solid var(--border);
+                border-radius: 6px;
+                color: var(--text-secondary);
+                cursor: pointer;
+                font-size: 0.875rem;
+            }
+            .btn-reset:hover {
+                border-color: var(--accent);
+                color: var(--text-primary);
+            }
+            .task-cards-container {
+                display: flex;
+                flex-direction: column;
+                gap: 1rem;
+                max-width: 1100px;
+            }
+            .task-card {
+                background: var(--bg-secondary);
+                border-radius: 12px;
+                border: 1px solid var(--border);
+                overflow: hidden;
+            }
+            .task-card.all-correct {
+                border-left: 4px solid var(--success);
+            }
+            .task-card.has-error {
+                border-left: 4px solid var(--error);
+            }
+            .task-card.no-results {
+                border-left: 4px solid var(--text-secondary);
+                opacity: 0.7;
+            }
+            .card-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 0.75rem 1rem;
+                background: var(--bg-tertiary);
+                border-bottom: 1px solid var(--border);
+            }
+            .card-meta {
+                display: flex;
+                align-items: center;
+                gap: 0.75rem;
+            }
+            .task-id {
+                font-weight: 600;
+                font-family: monospace;
+                color: var(--accent);
+            }
+            .type-badge {
+                padding: 0.2rem 0.6rem;
+                border-radius: 4px;
+                font-size: 0.75rem;
+                font-weight: 600;
+            }
+            .type-badge.fb {
+                background: rgba(244, 33, 46, 0.2);
+                color: var(--error);
+            }
+            .type-badge.tb {
+                background: rgba(0, 186, 124, 0.2);
+                color: var(--success);
+            }
+            .card-status {
+                display: flex;
+                align-items: center;
+                gap: 0.5rem;
+            }
+            .status-dot {
+                width: 10px;
+                height: 10px;
+                border-radius: 50%;
+            }
+            .status-dot.correct { background: var(--success); }
+            .status-dot.incorrect { background: var(--error); }
+            .status-dot.uncertain { background: var(--warning); }
+            .status-dot.missing {
+                background: transparent;
+                border: 2px dashed var(--text-secondary);
+            }
+            .btn-toggle {
+                background: none;
+                border: none;
+                color: var(--text-secondary);
+                cursor: pointer;
+                font-size: 0.875rem;
+                padding: 0.25rem 0.5rem;
+                border-radius: 4px;
+            }
+            .btn-toggle:hover {
+                background: var(--bg-secondary);
+                color: var(--text-primary);
+            }
+            .card-narrative {
+                padding: 0.75rem 1rem;
+                font-size: 0.875rem;
+                color: var(--text-secondary);
+                border-bottom: 1px solid var(--border);
+                line-height: 1.5;
+            }
+            .results-grid {
+                padding: 0.5rem 1rem;
+            }
+            .results-header {
+                display: grid;
+                grid-template-columns: 80px 1fr 70px 70px 120px 30px 30px;
+                gap: 0.5rem;
+                padding: 0.5rem 0;
+                font-size: 0.7rem;
+                color: var(--text-secondary);
+                text-transform: uppercase;
+                border-bottom: 1px solid var(--border);
+            }
+            .result-row {
+                border-bottom: 1px solid var(--border);
+            }
+            .result-row:last-child {
+                border-bottom: none;
+            }
+            .result-main {
+                display: grid;
+                grid-template-columns: 80px 1fr 70px 70px 120px 30px 30px;
+                gap: 0.5rem;
+                align-items: center;
+                padding: 0.5rem 0;
+                font-size: 0.8rem;
+            }
+            .result-label {
+                color: var(--text-secondary);
+                font-weight: 500;
+                font-size: 0.75rem;
+            }
+            .result-prompt {
+                font-family: monospace;
+                font-size: 0.75rem;
+                color: var(--text-primary);
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .result-expected {
+                font-family: monospace;
+                color: var(--text-secondary);
+            }
+            .result-parsed {
+                font-family: monospace;
+                font-weight: 600;
+            }
+            .result-parsed.correct { color: var(--success); }
+            .result-parsed.incorrect { color: var(--error); }
+            .result-parsed.uncertain { color: var(--warning); }
+            .result-parsed.missing { color: var(--text-secondary); opacity: 0.5; }
+            .result-raw {
+                font-family: monospace;
+                font-size: 0.75rem;
+                color: var(--text-secondary);
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .result-status {
+                font-weight: bold;
+                text-align: center;
+            }
+            .result-status.correct { color: var(--success); }
+            .result-status.incorrect { color: var(--error); }
+            .result-status.uncertain { color: var(--warning); }
+            .result-status.missing { color: var(--text-secondary); opacity: 0.5; }
+            .btn-row-toggle {
+                background: none;
+                border: none;
+                color: var(--text-secondary);
+                cursor: pointer;
+                font-size: 0.7rem;
+                padding: 0.2rem;
+                border-radius: 3px;
+            }
+            .btn-row-toggle:hover:not(:disabled) {
+                background: var(--bg-tertiary);
+                color: var(--text-primary);
+            }
+            .btn-row-toggle:disabled {
+                opacity: 0.3;
+                cursor: default;
+            }
+            .result-details {
+                background: var(--bg-tertiary);
+                padding: 0.75rem;
+                margin: 0.25rem 0 0.5rem 0;
+                border-radius: 6px;
+                font-size: 0.8rem;
+            }
+            .detail-item {
+                margin-bottom: 0.5rem;
+            }
+            .detail-item:last-child {
+                margin-bottom: 0;
+            }
+            .detail-label {
+                color: var(--text-secondary);
+                font-size: 0.7rem;
+                text-transform: uppercase;
+                display: block;
+                margin-bottom: 0.25rem;
+            }
+            .detail-value {
+                display: block;
+                background: var(--bg-primary);
+                padding: 0.5rem;
+                border-radius: 4px;
+                font-family: monospace;
+                font-size: 0.75rem;
+                white-space: pre-wrap;
+                word-break: break-word;
+            }
+            .card-details {
+                background: var(--bg-primary);
+                padding: 1rem;
+                border-top: 1px solid var(--border);
+            }
+            .detail-narrative {
+                margin-bottom: 1rem;
+            }
+            .detail-narrative h4 {
+                font-size: 0.75rem;
+                text-transform: uppercase;
+                color: var(--text-secondary);
+                margin-bottom: 0.5rem;
+            }
+            .detail-narrative p {
+                font-size: 0.875rem;
+                line-height: 1.6;
+            }
+            .detail-question {
+                background: var(--bg-secondary);
+                border-radius: 8px;
+                padding: 1rem;
+                margin-bottom: 0.75rem;
+            }
+            .detail-question h4 {
+                font-size: 0.875rem;
+                color: var(--accent);
+                margin-bottom: 0.75rem;
+            }
+            .detail-prompt {
+                background: var(--bg-tertiary);
+                padding: 0.75rem;
+                border-radius: 6px;
+                font-family: monospace;
+                font-size: 0.8rem;
+                margin-bottom: 0.75rem;
+                white-space: pre-wrap;
+                word-break: break-word;
+            }
+            .detail-response {
+                margin-bottom: 0.5rem;
+                font-size: 0.875rem;
+            }
+            .detail-response .response-label {
+                color: var(--text-secondary);
+            }
+            .detail-response code {
+                background: var(--bg-tertiary);
+                padding: 0.2rem 0.5rem;
+                border-radius: 4px;
+            }
+            .detail-comparison {
+                display: flex;
+                gap: 1.5rem;
+                font-size: 0.875rem;
+                color: var(--text-secondary);
+            }
+            .detail-comparison .correct { color: var(--success); }
+            .detail-comparison .incorrect { color: var(--error); }
+        </style>
+    """
 
-        <div class="filters" style="margin-bottom: 1rem; display: flex; gap: 1rem; flex-wrap: wrap;">
-            <div>
-                <label>Type: </label>
-                <select id="filter-type" onchange="filterTasks()">
-                    <option value="">All</option>
-                    <option value="true_belief">True Belief</option>
-                    <option value="false_belief">False Belief</option>
-                    <option value="mismatch">Mismatch</option>
-                    <option value="negation_trap">Negation Trap</option>
-                    <option value="belief_overwrite">Belief Overwrite</option>
-                </select>
-            </div>
-            <div>
-                <label>Result: </label>
-                <select id="filter-result" onchange="filterTasks()">
-                    <option value="">All</option>
-                    <option value="true">Correct</option>
-                    <option value="false">Wrong</option>
-                    <option value="uncertain">Uncertain</option>
-                </select>
-            </div>
-            <div>
-                <label>Search: </label>
-                <input type="text" id="filter-search" placeholder="Search prompts..." onkeyup="filterTasks()" style="width: 200px;">
+    # JavaScript for filtering and card expansion
+    tasks_js = """
+        <script>
+            function toggleCard(taskId) {
+                const details = document.getElementById('details-' + taskId);
+                const card = details.closest('.task-card');
+                const btn = card.querySelector('.btn-toggle');
+
+                if (details.style.display === 'none') {
+                    details.style.display = 'block';
+                    btn.textContent = '▼';
+                } else {
+                    details.style.display = 'none';
+                    btn.textContent = '▶';
+                }
+            }
+
+            function toggleRowDetails(rowId) {
+                const details = document.getElementById('row-details-' + rowId);
+                const row = details.closest('.result-row');
+                const btn = row.querySelector('.btn-row-toggle');
+
+                if (details.style.display === 'none') {
+                    details.style.display = 'block';
+                    btn.textContent = '▼';
+                } else {
+                    details.style.display = 'none';
+                    btn.textContent = '▶';
+                }
+            }
+
+            function filterTasks() {
+                const typeFilter = document.getElementById('filter-type').value;
+                const statusFilter = document.getElementById('filter-status').value;
+                const searchFilter = document.getElementById('filter-search').value.toLowerCase();
+
+                const cards = document.querySelectorAll('.task-card');
+                let visibleCount = 0;
+                let errorCount = 0;
+
+                cards.forEach(card => {
+                    const taskType = card.dataset.taskType;
+                    const status = card.dataset.status;
+                    const taskId = card.dataset.taskId;
+                    const familyId = card.dataset.familyId;
+                    const protagonistCorrect = card.dataset.protagonistCorrect;
+                    const realityCorrect = card.dataset.realityCorrect;
+                    const narrative = card.querySelector('.card-narrative').textContent.toLowerCase();
+
+                    let show = true;
+
+                    // Type filter
+                    if (typeFilter && taskType !== typeFilter) {
+                        show = false;
+                    }
+
+                    // Status filter
+                    if (statusFilter) {
+                        if (statusFilter === 'all-correct' && status !== 'all-correct') show = false;
+                        if (statusFilter === 'has-error' && status === 'all-correct') show = false;
+                        if (statusFilter === 'protagonist-wrong' && protagonistCorrect !== 'false') show = false;
+                        if (statusFilter === 'reality-wrong' && realityCorrect !== 'false') show = false;
+                    }
+
+                    // Search filter (task ID, family ID, or narrative)
+                    if (searchFilter) {
+                        const searchable = taskId.toLowerCase() + ' ' + familyId.toLowerCase() + ' ' + narrative;
+                        if (!searchable.includes(searchFilter)) {
+                            show = false;
+                        }
+                    }
+
+                    card.style.display = show ? 'block' : 'none';
+
+                    if (show) {
+                        visibleCount++;
+                        if (status !== 'all-correct') errorCount++;
+                    }
+
+                    // Collapse expanded cards when filtering
+                    const details = card.querySelector('.card-details');
+                    const btn = card.querySelector('.btn-toggle');
+                    if (details) {
+                        details.style.display = 'none';
+                        btn.textContent = '▶';
+                    }
+                });
+
+                // Update stats
+                document.getElementById('visible-count').textContent = visibleCount;
+                document.getElementById('error-count').textContent = errorCount;
+            }
+
+            function resetFilters() {
+                document.getElementById('filter-type').value = '';
+                document.getElementById('filter-status').value = '';
+                document.getElementById('filter-search').value = '';
+                filterTasks();
+            }
+        </script>
+    """
+
+    content = f"""
+        {tasks_css}
+        <div class="tasks-header">
+            <h1>Tasks</h1>
+            <div class="tasks-stats">
+                <span>Showing <strong id="visible-count">{total}</strong> of {total}</span>
+                <span><strong id="error-count">{total_with_errors}</strong> with errors</span>
             </div>
         </div>
 
-        <table id="tasks-table">
-            <thead>
-                <tr>
-                    <th class="sortable" onclick="sortTable(0)">ID ▼</th>
-                    <th class="sortable" onclick="sortTable(1)">Type</th>
-                    <th>Prompt</th>
-                    <th class="sortable" onclick="sortTable(3)">Expected</th>
-                    <th>Raw</th>
-                    <th>Parsed</th>
-                    <th class="sortable" onclick="sortTable(6)">Result</th>
-                    <th></th>
-                </tr>
-            </thead>
-            <tbody>
-                {''.join(rows)}
-            </tbody>
-        </table>
+        <div class="filters">
+            <div class="filter-group">
+                <label>Type:</label>
+                <select id="filter-type" onchange="filterTasks()">
+                    <option value="">All Types</option>
+                    <option value="true_belief">True Belief</option>
+                    <option value="false_belief">False Belief</option>
+                </select>
+            </div>
+            <div class="filter-group">
+                <label>Status:</label>
+                <select id="filter-status" onchange="filterTasks()">
+                    <option value="">All Results</option>
+                    <option value="all-correct">All Correct</option>
+                    <option value="has-error">Has Error</option>
+                    <option value="protagonist-wrong">Protagonist Wrong</option>
+                    <option value="reality-wrong">Reality Wrong</option>
+                </select>
+            </div>
+            <div class="filter-group">
+                <label>Search:</label>
+                <input type="text" id="filter-search" placeholder="Task ID, family, or narrative..." onkeyup="filterTasks()">
+            </div>
+            <button class="btn-reset" onclick="resetFilters()">Reset</button>
+        </div>
 
-        <style>
-            .filters select, .filters input {{
-                padding: 0.3rem 0.5rem;
-                border: 1px solid var(--border);
-                border-radius: 4px;
-                background: var(--card);
-            }}
-            .sortable {{ cursor: pointer; }}
-            .sortable:hover {{ background: var(--hover); }}
-            .btn-expand {{
-                background: none;
-                border: none;
-                cursor: pointer;
-                font-size: 0.8rem;
-                padding: 0.2rem 0.5rem;
-            }}
-            .details-row td {{
-                background: var(--hover);
-                padding: 1rem;
-            }}
-            .details-content {{
-                display: flex;
-                flex-direction: column;
-                gap: 0.5rem;
-            }}
-            .detail-section pre {{
-                background: var(--card);
-                padding: 0.5rem;
-                border-radius: 4px;
-                white-space: pre-wrap;
-                word-break: break-word;
-                margin: 0.25rem 0;
-            }}
-            .col-id {{ width: 60px; }}
-            .col-type {{ width: 120px; }}
-            .col-expected, .col-parsed {{ width: 80px; }}
-            .col-raw {{ max-width: 150px; overflow: hidden; text-overflow: ellipsis; }}
-            .col-result {{ width: 50px; text-align: center; }}
-            .col-expand {{ width: 30px; }}
-            .badge.warning {{ background: #f59e0b; color: white; }}
-            .badge.purple {{ background: #8b5cf6; color: white; }}
-        </style>
+        <div class="task-cards-container">
+            {''.join(cards)}
+        </div>
 
-        <script>
-            let sortCol = 0;
-            let sortAsc = true;
-
-            function toggleDetails(idx) {{
-                const row = document.getElementById('details-' + idx);
-                const btn = row.previousElementSibling.querySelector('.btn-expand');
-                if (row.style.display === 'none') {{
-                    row.style.display = 'table-row';
-                    btn.textContent = '▼';
-                }} else {{
-                    row.style.display = 'none';
-                    btn.textContent = '▶';
-                }}
-            }}
-
-            function filterTasks() {{
-                const typeFilter = document.getElementById('filter-type').value;
-                const resultFilter = document.getElementById('filter-result').value;
-                const searchFilter = document.getElementById('filter-search').value.toLowerCase();
-
-                const rows = document.querySelectorAll('#tasks-table tbody tr:not(.details-row)');
-                rows.forEach(row => {{
-                    const type = row.dataset.type;
-                    const correct = row.dataset.correct;
-                    const uncertain = row.dataset.uncertain;
-                    const prompt = row.querySelector('.col-prompt code').textContent.toLowerCase();
-
-                    let show = true;
-                    if (typeFilter && type !== typeFilter) show = false;
-                    if (resultFilter === 'uncertain' && uncertain !== 'true') show = false;
-                    else if (resultFilter && resultFilter !== 'uncertain' && correct !== resultFilter) show = false;
-                    if (searchFilter && !prompt.includes(searchFilter)) show = false;
-
-                    row.style.display = show ? '' : 'none';
-                    // Also hide details row
-                    const detailsRow = row.nextElementSibling;
-                    if (detailsRow && detailsRow.classList.contains('details-row')) {{
-                        detailsRow.style.display = 'none';
-                        row.querySelector('.btn-expand').textContent = '▶';
-                    }}
-                }});
-            }}
-
-            function sortTable(col) {{
-                const table = document.getElementById('tasks-table');
-                const tbody = table.querySelector('tbody');
-                const rows = Array.from(tbody.querySelectorAll('tr:not(.details-row)'));
-
-                if (col === sortCol) {{
-                    sortAsc = !sortAsc;
-                }} else {{
-                    sortCol = col;
-                    sortAsc = true;
-                }}
-
-                rows.sort((a, b) => {{
-                    let aVal = a.cells[col].textContent.trim();
-                    let bVal = b.cells[col].textContent.trim();
-
-                    // Natural sort for IDs
-                    if (col === 0) {{
-                        const parseId = (id) => {{
-                            const match = id.match(/([a-z]+)_(\\d+)(r?)/);
-                            if (match) return [match[1], parseInt(match[2]), match[3]];
-                            return [id, 0, ''];
-                        }};
-                        const [aPrefix, aNum, aSuffix] = parseId(aVal);
-                        const [bPrefix, bNum, bSuffix] = parseId(bVal);
-                        if (aPrefix !== bPrefix) return aPrefix.localeCompare(bPrefix);
-                        if (aNum !== bNum) return aNum - bNum;
-                        return aSuffix.localeCompare(bSuffix);
-                    }}
-
-                    return aVal.localeCompare(bVal);
-                }});
-
-                if (!sortAsc) rows.reverse();
-
-                // Re-append rows with their detail rows
-                rows.forEach((row, idx) => {{
-                    // Find the details row by data-id attribute
-                    const taskId = row.dataset.id;
-                    const detailsRow = row.nextElementSibling;
-                    tbody.appendChild(row);
-                    if (detailsRow && detailsRow.classList.contains('details-row')) {{
-                        tbody.appendChild(detailsRow);
-                    }}
-                }});
-            }}
-        </script>
+        {tasks_js}
     """
 
     return render_page("Tasks", content, "Tasks", selected_model=selected_model)

@@ -18,6 +18,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .task_generator import ToMTask
 
+# Large models that need CPU offloading on MPS
+LARGE_MODELS_MAX_MEMORY = {
+    "Qwen/Qwen2.5-32B": {"mps": "50GB", "cpu": "40GB"},
+}
+
+# Prefix to disable reasoning/thinking mode (always applied)
+NO_REASONING_PREFIX = "/no_think "
+
 
 # =============================================================================
 # Data Structures
@@ -67,7 +75,7 @@ class ModelOutput:
     task_type: str
     prompt: str
     model_response: str
-    expected_answer: str
+    expected_answer: Optional[str]
     is_correct: bool
     # Full text fields
     full_input_text: str
@@ -151,7 +159,7 @@ class ModelRunner:
         model_name: str = "mistralai/Mistral-7B-v0.3",
         device: str = "auto",
         torch_dtype: torch.dtype = torch.bfloat16,
-        max_memory: Optional[Dict[int, str]] = None,
+        max_memory: Optional[Dict[str, str]] = None,
         auto_optimize_batch_size: bool = True,
         models_config_path: Optional[Path] = None,
     ):
@@ -181,6 +189,11 @@ class ModelRunner:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "left"
+
+        # Auto-configure max_memory for large models on MPS
+        if max_memory is None and model_name in LARGE_MODELS_MAX_MEMORY:
+            max_memory = LARGE_MODELS_MAX_MEMORY[model_name]
+            print(f"Using CPU offloading for large model: {max_memory}")
 
         # Load model with attention output enabled
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -321,7 +334,7 @@ class ModelRunner:
 
         # Tokenization
         tokenize_start = time.time()
-        input_text = task.full_prompt
+        input_text = NO_REASONING_PREFIX + task.full_prompt
         inputs = self.tokenizer(
             input_text,
             return_tensors="pt",
@@ -359,9 +372,6 @@ class ModelRunner:
 
         total_time_ms = (time.time() - total_start) * 1000
 
-        # Correctness
-        is_correct = task.expected_answer.lower() in response.lower()
-
         # Attention extraction
         attentions = None
         if extract_attention and hasattr(outputs, "attentions") and outputs.attentions:
@@ -388,8 +398,8 @@ class ModelRunner:
             task_type=task.task_type,
             prompt=task.full_prompt,
             model_response=response,
-            expected_answer=task.expected_answer,
-            is_correct=is_correct,
+            expected_answer=getattr(task, 'expected_answer', None),
+            is_correct=False,  # Scoring done by behavioral_analysis
             full_input_text=input_text,
             full_output_text=full_output_text,
             raw_generated_text=raw_generated_text,
@@ -583,7 +593,7 @@ class ModelRunner:
 
         # Tokenization
         tokenize_start = time.time()
-        prompts = [task.full_prompt for task in tasks]
+        prompts = [NO_REASONING_PREFIX + task.full_prompt for task in tasks]
         inputs = self.tokenizer(
             prompts,
             return_tensors="pt",
@@ -631,7 +641,6 @@ class ModelRunner:
             raw_generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
             response = raw_generated_text.strip()
 
-            is_correct = task.expected_answer.lower() in response.lower()
             output_token_count = len(generated_ids)
 
             speed_metrics = SpeedMetrics(
@@ -648,8 +657,8 @@ class ModelRunner:
                 task_type=task.task_type,
                 prompt=task.full_prompt,
                 model_response=response,
-                expected_answer=task.expected_answer,
-                is_correct=is_correct,
+                expected_answer=getattr(task, 'expected_answer', None),
+                is_correct=False,  # Scoring done by behavioral_analysis
                 full_input_text=task.full_prompt,
                 full_output_text=full_output_text,
                 raw_generated_text=raw_generated_text,
@@ -678,32 +687,22 @@ class ModelRunner:
 
 
 if __name__ == "__main__":
-    from .task_generator import generate_tasks
+    import argparse
+    parser = argparse.ArgumentParser(description="Test model runner")
+    parser.add_argument("--model", default="mistralai/Mistral-7B-v0.3", help="Model name")
+    parser.add_argument("--prompt", default="The capital of France is", help="Test prompt")
+    args = parser.parse_args()
 
-    # Generate test tasks
-    tasks = generate_tasks(num_families=1)
-
-    # Load model
-    runner = ModelRunner("Qwen/Qwen2.5-0.5B")
-
-    # Show model info
+    print(f"Loading {args.model}...")
+    runner = ModelRunner(args.model)
     info = runner.get_model_info()
-    print(f"Model: {info['model_name']}")
-    print(f"  Layers: {info['num_layers']}, Heads: {info['num_heads']}")
-    print(f"  Device: {info['device']}")
-    print(f"  Load time: {info['load_time_ms']:.0f}ms")
-    print(f"  Optimal batch size: {info['optimal_batch_size']}")
+    print(f"Loaded in {info['load_time_ms']:.0f}ms | {info['num_layers']} layers | {info['device']}")
 
-    # Run tasks
-    results = runner.run_batch(tasks, max_new_tokens=3, stop_strings=["."], extract_attention=True, attention_sample_size=2)
+    # Simple completion test
+    from collections import namedtuple
+    TestTask = namedtuple("TestTask", ["task_id", "task_type", "full_prompt"])
+    task = TestTask("test", "test", args.prompt)
+    output = runner.run_task(task, max_new_tokens=20, stop_strings=[".", "\n"], extract_attention=False)
+    print(f"Prompt: {args.prompt}")
+    print(f"Response: {output.model_response}")
 
-    print(f"\nResults:")
-    print(f"  Accuracy: {results.accuracy:.1%}")
-    print(f"  Batch size used: {results.batch_size_used}")
-    print(f"  Throughput: {results.tokens_per_second:.1f} tokens/sec")
-    print(f"  Total time: {results.total_time_ms:.0f}ms")
-
-    for output in results.outputs:
-        status = "✓" if output.is_correct else "✗"
-        has_attn = "📊" if output.has_attentions() else ""
-        print(f"{status} {has_attn} [{output.task_type}] {output.task_id}: {output.model_response}")

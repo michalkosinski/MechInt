@@ -33,6 +33,28 @@
       "dtype": "torch.bfloat16",
       "last_optimized": "2026-01-31T16:46:13.466916",
       "optimization_device": "mps:0"
+    },
+    "Qwen/Qwen2.5-14B": {
+      "model_name": "Qwen/Qwen2.5-14B",
+      "optimal_batch_size": 50,
+      "num_layers": 48,
+      "num_heads": 40,
+      "hidden_size": 5120,
+      "device": "mps:0",
+      "dtype": "torch.bfloat16",
+      "last_optimized": "2026-02-01T17:54:47.953169",
+      "optimization_device": "mps:0"
+    },
+    "Qwen/Qwen2.5-32B": {
+      "model_name": "Qwen/Qwen2.5-32B",
+      "optimal_batch_size": 4,
+      "num_layers": 64,
+      "num_heads": 40,
+      "hidden_size": 5120,
+      "device": "mps:0",
+      "dtype": "torch.bfloat16",
+      "last_optimized": "2026-02-01T19:00:00.000000",
+      "optimization_device": "mps:0"
     }
   }
 }

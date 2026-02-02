@@ -6,53 +6,61 @@
 Behavioral analysis for Theory of Mind experiments.
 
 Response parsing and evaluation logic. Uses model_runner for inference.
-
-Usage:
-    python -m src.behavioral_analysis
-    python -m src.behavioral_analysis --model "Qwen/Qwen2.5-0.5B"
-    python -m src.behavioral_analysis --tasks-file tasks.json --batch-size 8
 """
 
-import argparse
 import json
-import os
+from collections import namedtuple
 from datetime import datetime
 from pathlib import Path
 from typing import List
 
-from dotenv import load_dotenv
+from .task_generator import ToMTask
+from .model_runner import ModelRunner
 
-load_dotenv()
+# Simple task wrapper for model_runner (needs: task_id, task_type, full_prompt)
+PromptTask = namedtuple("PromptTask", ["task_id", "task_type", "full_prompt"])
 
-from .task_generator import ToMTask, load_tasks
-from .model_runner import ModelRunner, ModelOutput
+# Question templates applied to narrative at inference time
+QUESTION_TEMPLATES = {
+    "reality": "The {obj} is in the",
+    "protagonist": "{protagonist} will look for the {obj} in the",
+    "observer": "{observer} will look for the {obj} in the",
+}
 
-# NOTE: Reasoning/thinking mode is ALWAYS disabled for behavioral analysis.
-# Models like SmolLM3 support /think and /no_think modes - we use /no_think
-# to ensure fast, direct responses without chain-of-thought reasoning.
-# This keeps responses comparable across models and avoids confounding ToM
-# results with reasoning capabilities.
-DISABLE_REASONING_PREFIX = "/no_think "
-REASONING_MODELS = ["SmolLM3", "smollm3"]  # Models that support thinking mode
+def build_prompt(task: ToMTask, question_type: str) -> str:
+    """Build full prompt from narrative + question template."""
+    template = QUESTION_TEMPLATES[question_type]
+    question = template.format(
+        obj=task.obj,
+        protagonist=task.protagonist,
+        observer=task.observer,
+    )
+    return f"{task.narrative} {question}"
+
+
+def get_expected_answer(task: ToMTask, question_type: str) -> str:
+    """Get expected answer based on question type."""
+    if question_type == "reality":
+        return task.final_location
+    elif question_type == "protagonist":
+        return task.protagonist_belief
+    elif question_type == "observer":
+        return task.final_location
+    else:
+        raise ValueError(f"Unknown question type: {question_type}")
+
 
 def parse_response(raw: str, valid_containers: List[str]) -> str:
-    """
-    Parse model response to extract the predicted container.
-    """
+    """Parse model response to extract the predicted container."""
     if not raw or not raw.strip():
         return "[UNCERTAIN]"
 
-    text = " ".join(raw.strip().lower().split())  # normalize whitespace
+    text = " ".join(raw.strip().lower().split())
 
-    # Expand synonyms in text for matching
-    text = text.replace("cabinet", "cupboard")
-
-    # Check for hedging: "or the [container]"
     for c in valid_containers:
         if f"or the {c.lower()}" in text:
             return "[UNCERTAIN]"
 
-    # Find first mentioned container
     first_pos = float('inf')
     first_container = None
     for c in valid_containers:
@@ -61,113 +69,67 @@ def parse_response(raw: str, valid_containers: List[str]) -> str:
             first_pos = pos
             first_container = c
 
-    if first_container:
-        return first_container
-
-    # No container found → uncertain
-    return "[UNCERTAIN]"
-
-
-def evaluate_outputs(outputs: List[ModelOutput], tasks: List[ToMTask]) -> List[dict]:
-    """
-    Evaluate model outputs using proper response parsing.
-
-    Args:
-        outputs: List of ModelOutput from model_runner
-        tasks: List of tasks (for container info)
-
-    Returns:
-        List of evaluation dicts with parsed responses
-    """
-    task_lookup = {t.task_id: t for t in tasks}
-
-    results = []
-    for output in outputs:
-        task = task_lookup[output.task_id]
-        parsed = parse_response(output.model_response, [task.c1, task.c2])
-
-        results.append({
-            "task_id": output.task_id,
-            "task_type": output.task_type,
-            "family_id": task.family_id,
-            "prompt": output.prompt,
-            "response": output.model_response,
-            "parsed_response": parsed,
-            "expected": output.expected_answer,
-            "is_correct": parsed.lower() == task.expected_answer.lower(),
-            "is_uncertain": parsed == "[UNCERTAIN]",
-        })
-
-    return results
-
-
-def _should_disable_reasoning(model_name: str) -> bool:
-    """Check if model supports thinking mode that should be disabled."""
-    return any(rm.lower() in model_name.lower() for rm in REASONING_MODELS)
-
-
-def _prepare_tasks_for_inference(tasks: List[ToMTask], model_name: str) -> List[ToMTask]:
-    """Prepare tasks, disabling reasoning mode if needed."""
-    if not _should_disable_reasoning(model_name):
-        return tasks
-
-    # Prepend /no_think to disable reasoning mode
-    from dataclasses import replace
-    return [
-        replace(t, full_prompt=DISABLE_REASONING_PREFIX + t.full_prompt)
-        for t in tasks
-    ]
+    return first_container if first_container else "[UNCERTAIN]"
 
 
 def run_behavioral_analysis(
     runner: ModelRunner,
     tasks: List[ToMTask],
+    question_type: str = "protagonist",
     max_new_tokens: int = 20,
 ) -> tuple[List[dict], dict]:
-    """
-    Run behavioral analysis on tasks.
+    """Run behavioral analysis on tasks. Returns (results, summary)."""
+    prompt_tasks = [
+        PromptTask(t.task_id, t.task_type, build_prompt(t, question_type))
+        for t in tasks
+    ]
 
-    Args:
-        runner: ModelRunner instance
-        tasks: List of ToM tasks
-        max_new_tokens: Max tokens to generate
-
-    Returns:
-        Tuple of (results list, summary dict)
-    """
-    # Disable reasoning mode for models that support it
-    inference_tasks = _prepare_tasks_for_inference(tasks, runner.model_name)
-
-    # Run inference (batch_size auto-optimized by runner)
+    # Run inference
     batch_output = runner.run_batch(
-        inference_tasks,
+        prompt_tasks,
         max_new_tokens=max_new_tokens,
         extract_attention=False,
         stop_strings=[".", "?", "!"],
     )
 
-    # Evaluate with proper parsing
-    results = evaluate_outputs(batch_output.outputs, tasks)
+    # Evaluate outputs
+    task_lookup = {t.task_id: t for t in tasks}
+    results = []
+    for output in batch_output.outputs:
+        task = task_lookup[output.task_id]
+        containers = [task.initial_location, task.final_location]
+        parsed = parse_response(output.model_response, containers)
+        expected = get_expected_answer(task, question_type)
+
+        results.append({
+            "task_id": output.task_id,
+            "task_type": output.task_type,
+            "family_id": task.family_id,
+            "question_type": question_type,
+            "prompt": output.prompt,
+            "response": output.model_response,
+            "parsed_response": parsed,
+            "expected": expected,
+            "is_correct": parsed.lower() == expected.lower(),
+            "is_uncertain": parsed == "[UNCERTAIN]",
+        })
 
     # Compute summary
     correct = sum(1 for r in results if r["is_correct"])
     uncertain = sum(1 for r in results if r["is_uncertain"])
-
     fb_results = [r for r in results if r["task_type"] == "false_belief"]
     tb_results = [r for r in results if r["task_type"] == "true_belief"]
 
-    fb_correct = sum(1 for r in fb_results if r["is_correct"])
-    tb_correct = sum(1 for r in tb_results if r["is_correct"])
-
     summary = {
         "model_name": runner.model_name,
+        "question_type": question_type,
         "timestamp": datetime.now().isoformat(),
         "total_tasks": len(results),
         "correct": correct,
         "accuracy": correct / len(results) if results else 0,
         "uncertain": uncertain,
-        "false_belief_accuracy": fb_correct / len(fb_results) if fb_results else 0,
-        "true_belief_accuracy": tb_correct / len(tb_results) if tb_results else 0,
+        "false_belief_accuracy": sum(1 for r in fb_results if r["is_correct"]) / len(fb_results) if fb_results else 0,
+        "true_belief_accuracy": sum(1 for r in tb_results if r["is_correct"]) / len(tb_results) if tb_results else 0,
         "total_time_ms": batch_output.total_time_ms,
     }
 
@@ -180,81 +142,31 @@ def save_results(results: List[dict], summary: dict, output_dir: Path) -> Path:
     behavioral_dir.mkdir(parents=True, exist_ok=True)
 
     model_slug = summary["model_name"].replace("/", "_")
-    output_path = behavioral_dir / f"{model_slug}.json"
+    output_path = behavioral_dir / f"{model_slug}_{summary['question_type']}.json"
 
-    data = {
-        "model": summary["model_name"],
-        "timestamp": summary["timestamp"],
-        "summary": {
-            "overall_accuracy": summary["accuracy"],
-            "false_belief_accuracy": summary["false_belief_accuracy"],
-            "true_belief_accuracy": summary["true_belief_accuracy"],
-            "num_tasks": summary["total_tasks"],
-            "num_correct": summary["correct"],
-            "num_uncertain": summary["uncertain"],
-            "total_time_ms": summary["total_time_ms"],
-        },
-        "details": results,
-    }
-
+    data = {"summary": summary, "details": results}
     output_path.write_text(json.dumps(data, indent=2))
     return output_path
 
 
-# =============================================================================
-# CLI
-# =============================================================================
-
-def main():
-    """Run behavioral analysis from command line."""
+if __name__ == "__main__":
+    import argparse
     parser = argparse.ArgumentParser(description="Run behavioral analysis on ToM tasks")
-    parser.add_argument("--model", "-m", default=os.getenv("MODEL_NAME", "Qwen/Qwen2.5-3B"))
-    parser.add_argument("--tasks-file", "-t", type=Path, default=Path("tasks.json"))
-    parser.add_argument("--output-dir", "-o", type=Path, default=Path("results"))
-    parser.add_argument("--max-tokens", type=int, default=20)
-
+    parser.add_argument("--model", default="mistralai/Mistral-7B-v0.3", help="Model name")
+    parser.add_argument("--tasks", type=int, default=None, help="Number of tasks to run (default: all)")
+    parser.add_argument("--question", default="protagonist", choices=["protagonist", "reality", "observer"])
     args = parser.parse_args()
 
-    if not args.tasks_file.exists():
-        print(f"Error: Tasks file not found: {args.tasks_file}")
-        print("Run 'python -m src.task_generator' first to generate tasks.")
-        return 1
+    from .task_generator import load_tasks
 
-    print(f"Loading tasks from {args.tasks_file}")
-    tasks = load_tasks(args.tasks_file)
-    print(f"Loaded {len(tasks)} tasks")
-
-    # Load model and run analysis
+    tasks = load_tasks(Path(__file__).parent.parent / "tasks.json")
+    if args.tasks is not None:
+        tasks = tasks[:args.tasks]
     runner = ModelRunner(args.model)
-    results, summary = run_behavioral_analysis(
-        runner, tasks,
-        max_new_tokens=args.max_tokens,
-    )
+    results, summary = run_behavioral_analysis(runner, tasks, question_type=args.question)
+    output_path = save_results(results, summary, Path(__file__).parent.parent / "results")
 
-    # Print summary
-    print("\n" + "=" * 50)
-    print("BEHAVIORAL ANALYSIS RESULTS")
-    print("=" * 50)
     print(f"Model: {summary['model_name']}")
-    print(f"Overall accuracy: {summary['accuracy']:.1%} ({summary['correct']}/{summary['total_tasks']})")
-    print(f"  False belief: {summary['false_belief_accuracy']:.1%}")
-    print(f"  True belief:  {summary['true_belief_accuracy']:.1%}")
-    print(f"  Uncertain:    {summary['uncertain']}")
-    print(f"Total time: {summary['total_time_ms'] / 1000:.1f}s")
-
-    # Save results
-    output_path = save_results(results, summary, args.output_dir)
-    print(f"\nResults saved to: {output_path}")
-
-    # Show sample errors
-    errors = [r for r in results if not r["is_correct"]]
-    if errors:
-        print(f"\nSample errors ({min(5, len(errors))} of {len(errors)}):")
-        for r in errors[:5]:
-            print(f"  [{r['task_type']}] {r['task_id']}: got '{r['response']}' → '{r['parsed_response']}', expected '{r['expected']}'")
-
-    return 0
-
-
-if __name__ == "__main__":
-    exit(main())
+    print(f"Tasks: {summary['total_tasks']} | Correct: {summary['correct']}")
+    print(f"Accuracy: {summary['accuracy']:.1%} (TB: {summary['true_belief_accuracy']:.1%}, FB: {summary['false_belief_accuracy']:.1%})")
+    print(f"Saved: {output_path}")
