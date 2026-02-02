@@ -10,7 +10,14 @@ import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
+
+
+class HasFullPrompt(Protocol):
+    """Protocol for objects with full_prompt attribute."""
+    task_id: str
+    task_type: str
+    full_prompt: str
 
 import torch
 from tqdm import tqdm
@@ -521,7 +528,7 @@ class ModelRunner:
 
     def iter_hidden_states(
         self,
-        tasks: List[ToMTask],
+        tasks: List[HasFullPrompt],
         batch_size: Optional[int] = None,
     ):
         """
@@ -684,6 +691,43 @@ class ModelRunner:
             "load_time_ms": self.load_time_ms,
             "optimal_batch_size": self.optimal_batch_size,
         }
+
+    def get_candidate_probabilities(
+        self,
+        prompt: str,
+        candidates: List[str],
+    ) -> Dict[str, float]:
+        """
+        Get probability of each candidate being the next token(s).
+
+        Performs a forward pass (no generation) and computes softmax
+        probabilities for each candidate's first token.
+
+        Args:
+            prompt: The input text ending where completion is expected
+            candidates: List of possible completions (e.g., ["box", "basket"])
+
+        Returns:
+            Dict mapping each candidate to its probability
+        """
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+
+        with torch.no_grad():
+            outputs = self.model(input_ids=inputs.input_ids)
+            logits = outputs.logits[:, -1, :]  # Last position logits
+            probs = torch.softmax(logits, dim=-1)
+
+        result = {}
+        for candidate in candidates:
+            # Encode candidate and get first token ID
+            token_ids = self.tokenizer.encode(candidate, add_special_tokens=False)
+            if token_ids:
+                # Use first token probability
+                result[candidate] = probs[0, token_ids[0]].item()
+            else:
+                result[candidate] = 0.0
+
+        return result
 
 
 if __name__ == "__main__":

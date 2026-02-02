@@ -188,14 +188,17 @@ class Dashboard:
         probing_dir = self.results_dir / "probing"
         if self.model:
             model_dir = probing_dir / self.model.replace("/", "_")
-            metrics_path = model_dir / "probe_metrics.json"
-            if metrics_path.exists():
-                return json.loads(metrics_path.read_text())
+            # Try multipos first (new format), then fall back to old format
+            for filename in ["probe_metrics_multipos.json", "probe_metrics.json"]:
+                metrics_path = model_dir / filename
+                if metrics_path.exists():
+                    return json.loads(metrics_path.read_text())
             return None
 
         if probing_dir.exists():
-            for metrics_path in probing_dir.glob("*/probe_metrics.json"):
-                return json.loads(metrics_path.read_text())
+            for pattern in ["*/probe_metrics_multipos.json", "*/probe_metrics.json"]:
+                for metrics_path in probing_dir.glob(pattern):
+                    return json.loads(metrics_path.read_text())
         return None
 
     def get_probing_predictions(self) -> Optional[Dict]:
@@ -203,14 +206,17 @@ class Dashboard:
         probing_dir = self.results_dir / "probing"
         if self.model:
             model_dir = probing_dir / self.model.replace("/", "_")
-            predictions_path = model_dir / "probe_predictions.json"
-            if predictions_path.exists():
-                return json.loads(predictions_path.read_text())
+            # Try multipos first (new format), then fall back to old format
+            for filename in ["probe_predictions_multipos.json", "probe_predictions.json"]:
+                predictions_path = model_dir / filename
+                if predictions_path.exists():
+                    return json.loads(predictions_path.read_text())
             return None
 
         if probing_dir.exists():
-            for predictions_path in probing_dir.glob("*/probe_predictions.json"):
-                return json.loads(predictions_path.read_text())
+            for pattern in ["*/probe_predictions_multipos.json", "*/probe_predictions.json"]:
+                for predictions_path in probing_dir.glob(pattern):
+                    return json.loads(predictions_path.read_text())
         return None
 
     def get_attention_results(self) -> Optional[Dict]:
@@ -226,6 +232,20 @@ class Dashboard:
         if attention_dir.exists():
             for metrics_path in attention_dir.glob("*/attention_metrics.json"):
                 return json.loads(metrics_path.read_text())
+        return None
+
+    def get_behavioral_probing_results(self) -> Optional[Dict]:
+        """Load behavioral probing results for the selected model (if available)."""
+        if self.model:
+            model_dir = self.results_dir / self.model.replace("/", "_") / "behavioral_probing"
+            results_path = model_dir / "probing_results.json"
+            if results_path.exists():
+                return json.loads(results_path.read_text())
+            return None
+
+        # Search for any behavioral probing results
+        for results_path in self.base_results_dir.glob("*/behavioral_probing/probing_results.json"):
+            return json.loads(results_path.read_text())
         return None
 
 
@@ -247,6 +267,7 @@ def render_page(title: str, content: str, nav_active: str = "", selected_model: 
         ("Overview", "/"),
         ("Tasks", "/tasks"),
         ("Probing", "/probing"),
+        ("Beh. Probing", "/behavioral-probing"),
         ("Attention", "/attention"),
     ]
 
@@ -1717,12 +1738,15 @@ def render_probing(selected_model: Optional[str] = None) -> str:
         probing_dir = RESULTS_DIR / "probing"
         available_probe_models = []
         if probing_dir.exists():
-            for metrics_path in probing_dir.glob("*/probe_metrics.json"):
-                available_probe_models.append(metrics_path.parent.name)
+            for pattern in ["*/probe_metrics_multipos.json", "*/probe_metrics.json"]:
+                for metrics_path in probing_dir.glob(pattern):
+                    model_name_from_path = metrics_path.parent.name
+                    if model_name_from_path not in available_probe_models:
+                        available_probe_models.append(model_name_from_path)
         available_probe_models.sort()
         expected_metrics_path = "N/A"
         if selected_model:
-            expected_metrics_path = str(Path("results") / "probing" / selected_model.replace("/", "_") / "probe_metrics.json")
+            expected_metrics_path = str(Path("results") / "probing" / selected_model.replace("/", "_") / "probe_metrics_multipos.json")
         available_models_display = ", ".join(available_probe_models) if available_probe_models else "None found"
         expected_metrics_path_html = html_module.escape(expected_metrics_path)
         available_models_html = html_module.escape(available_models_display)
@@ -1747,7 +1771,18 @@ def render_probing(selected_model: Optional[str] = None) -> str:
     config = probing.get("config", {})
     results = probing.get("results", {})
     timing = probing.get("timing", {})
-    feature_position = probing.get("feature_position", "prompt_end")
+    probe_positions = probing.get("probe_positions", [])
+
+    # Detect if this is multi-position format (new) or single-position format (old)
+    is_multipos = bool(probe_positions) or any(key in results for key in ["after_put", "before_return", "prompt_end"])
+    if not probe_positions:
+        # Fall back to old format - treat as single position "prompt_end"
+        probe_positions = ["prompt_end"]
+        if not is_multipos:
+            # Old format: results are directly {label_type: data}
+            results = {"prompt_end": results}
+
+    feature_position = probe_positions[-1] if probe_positions else "prompt_end"  # Show last position by default
 
     # Build configuration display
     config_html = f"""
@@ -1811,79 +1846,132 @@ def render_probing(selected_model: Optional[str] = None) -> str:
         </div>
     """
 
-    # Build sections for each probe type
+    # Position descriptions for display
+    POSITION_DESCRIPTIONS = {
+        "after_put": {
+            "title": "After Object Placement",
+            "desc": "Hidden states captured right after the protagonist places the object. No belief divergence yet.",
+        },
+        "before_return": {
+            "title": "Before Return",
+            "desc": "Hidden states captured after all events, just before the protagonist returns. Belief may have diverged from reality.",
+        },
+        "prompt_end": {
+            "title": "End of Prompt",
+            "desc": "Hidden states at the end of the full narrative including the question.",
+        },
+    }
+
+    # Build summary cards comparing positions (for multi-position)
+    summary_cards = ""
+    if is_multipos and len(probe_positions) > 1:
+        summary_rows = []
+        for label_type in ["false_belief", "world_location", "belief_location"]:
+            row_cells = [f"<td><strong>{PROBE_EXPLANATIONS.get(label_type, {}).get('title', label_type)}</strong></td>"]
+            for pos in probe_positions:
+                pos_results = results.get(pos, {}).get(label_type, {})
+                best_acc = pos_results.get("best_accuracy", 0) * 100
+                best_layer = pos_results.get("best_layer", "?")
+                acc_class = "success" if best_acc >= 80 else "warning" if best_acc >= 60 else "error" if best_acc > 50 else ""
+                row_cells.append(f'<td class="{acc_class}">{best_acc:.1f}% (L{best_layer})</td>')
+            summary_rows.append(f"<tr>{''.join(row_cells)}</tr>")
+
+        pos_headers = "".join([f"<th>{POSITION_DESCRIPTIONS.get(p, {}).get('title', p)}</th>" for p in probe_positions])
+        summary_cards = f"""
+            <div class="summary-comparison" style="margin-bottom: 2rem;">
+                <h2>Summary: Accuracy by Position</h2>
+                <table class="summary-table">
+                    <thead><tr><th>Label</th>{pos_headers}</tr></thead>
+                    <tbody>{''.join(summary_rows)}</tbody>
+                </table>
+            </div>
+        """
+
+    # Build sections for each position and probe type
     sections = []
 
-    for label_type, label_data in results.items():
-        explanation = PROBE_EXPLANATIONS.get(label_type, {})
-        metrics = label_data.get("metrics", [])
-        if not metrics:
-            continue
+    for pos_name in probe_positions:
+        pos_info = POSITION_DESCRIPTIONS.get(pos_name, {"title": pos_name, "desc": ""})
+        pos_results = results.get(pos_name, {})
 
-        # Calculate stats
-        best_layer = label_data.get("best_layer", 0)
-        best_acc = label_data.get("best_accuracy", 0) * 100
-
-        best_random = 50.0
-        best_auc = 0.5
-        for m in metrics:
-            if m.get("layer") == best_layer:
-                best_auc = m.get("auc", 0.5)
-                break
-
-        delta = best_acc - best_random
-        delta_class = _delta_color(delta)
-
-        # Build accuracy chart (CSS bars)
-        chart_bars = []
-        max_acc = max(m.get("accuracy", 0) for m in metrics) if metrics else 1.0
-        max_acc = max(max_acc, 0.6)  # Ensure reasonable scale
-
-        for m in metrics:
-            acc = m.get("accuracy", 0)
-            rand = 0.5
-            layer = m.get("layer", 0)
-            height_acc = (acc / max_acc) * 100
-            height_rand = (rand / max_acc) * 100
-
-            chart_bars.append(f"""
-                <div class="chart-bar-group" title="Layer {layer}: {acc*100:.1f}% (random: {rand*100:.1f}%)">
-                    <div class="chart-bar chart-bar-acc" style="height: {height_acc}%;"></div>
-                    <div class="chart-bar chart-bar-rand" style="height: {height_rand}%;"></div>
-                    <span class="chart-label">{layer}</span>
+        if len(probe_positions) > 1:
+            sections.append(f"""
+                <div class="position-section">
+                    <h2 class="position-header">{pos_info['title']}</h2>
+                    <p class="position-desc">{pos_info['desc']}</p>
                 </div>
             """)
 
-        # Build metrics table rows
-        table_rows = []
-        for m in metrics:
-            acc = m.get("accuracy", 0) * 100
-            rand = 50.0
-            row_delta = acc - rand
-            row_class = _delta_color(row_delta)
+        for label_type, label_data in pos_results.items():
+            explanation = PROBE_EXPLANATIONS.get(label_type, {})
+            metrics = label_data.get("metrics", [])
+            if not metrics:
+                continue
 
-            table_rows.append(f"""
-                <tr class="{'highlight-row' if m.get('layer') == best_layer else ''}">
-                    <td>{m.get('layer')}</td>
-                    <td><strong>{acc:.1f}%</strong></td>
-                    <td>{m.get('auc', 0):.3f}</td>
-                    <td>{m.get('f1', 0):.3f}</td>
-                    <td>{m.get('brier', 0):.3f}</td>
-                    <td>{rand:.1f}%</td>
-                    <td class="{row_class}">{row_delta:+.1f}%</td>
-                </tr>
-            """)
+            # Calculate stats
+            best_layer = label_data.get("best_layer", 0)
+            best_acc = label_data.get("best_accuracy", 0) * 100
 
-        # Heatmap cells
-        heatmap_cells = []
-        for m in metrics:
-            acc = m.get("accuracy", 0)
-            heatmap_cells.append(
-                f"<div class='heatmap-cell' title='Layer {m.get('layer')}: {acc*100:.1f}%' "
-                f"style='background: {_accuracy_color(acc)}'>{m.get('layer')}</div>"
-            )
+            best_random = 50.0
+            best_auc = 0.5
+            for m in metrics:
+                if m.get("layer") == best_layer:
+                    best_auc = m.get("auc", 0.5)
+                    break
 
-        sections.append(f"""
+            delta = best_acc - best_random
+            delta_class = _delta_color(delta)
+
+            # Build accuracy chart (CSS bars)
+            chart_bars = []
+            max_acc = max(m.get("accuracy", 0) for m in metrics) if metrics else 1.0
+            max_acc = max(max_acc, 0.6)  # Ensure reasonable scale
+
+            for m in metrics:
+                acc = m.get("accuracy", 0)
+                rand = 0.5
+                layer = m.get("layer", 0)
+                height_acc = (acc / max_acc) * 100
+                height_rand = (rand / max_acc) * 100
+
+                chart_bars.append(f"""
+                    <div class="chart-bar-group" title="Layer {layer}: {acc*100:.1f}% (random: {rand*100:.1f}%)">
+                        <div class="chart-bar chart-bar-acc" style="height: {height_acc}%;"></div>
+                        <div class="chart-bar chart-bar-rand" style="height: {height_rand}%;"></div>
+                        <span class="chart-label">{layer}</span>
+                    </div>
+                """)
+
+            # Build metrics table rows
+            table_rows = []
+            for m in metrics:
+                acc = m.get("accuracy", 0) * 100
+                rand = 50.0
+                row_delta = acc - rand
+                row_class = _delta_color(row_delta)
+
+                table_rows.append(f"""
+                    <tr class="{'highlight-row' if m.get('layer') == best_layer else ''}">
+                        <td>{m.get('layer')}</td>
+                        <td><strong>{acc:.1f}%</strong></td>
+                        <td>{m.get('auc', 0):.3f}</td>
+                        <td>{m.get('f1', 0):.3f}</td>
+                        <td>{m.get('brier', 0):.3f}</td>
+                        <td>{rand:.1f}%</td>
+                        <td class="{row_class}">{row_delta:+.1f}%</td>
+                    </tr>
+                """)
+
+            # Heatmap cells
+            heatmap_cells = []
+            for m in metrics:
+                acc = m.get("accuracy", 0)
+                heatmap_cells.append(
+                    f"<div class='heatmap-cell' title='Layer {m.get('layer')}: {acc*100:.1f}%' "
+                    f"style='background: {_accuracy_color(acc)}'>{m.get('layer')}</div>"
+                )
+
+            sections.append(f"""
             <div class="probe-section">
                 <div class="probe-header">
                     <h2>{explanation.get('title', label_type)}</h2>
@@ -1896,7 +1984,7 @@ def render_probing(selected_model: Optional[str] = None) -> str:
                 </div>
 
                 <div class="position-description">
-                    <strong>Feature:</strong> {feature_position}
+                    <strong>Position:</strong> {pos_name}
                 </div>
 
                 <div class="card-grid" style="grid-template-columns: repeat(4, 1fr);">
@@ -2229,6 +2317,51 @@ def render_probing(selected_model: Optional[str] = None) -> str:
             .success { color: var(--success); }
             .warning { color: var(--warning); }
             .error { color: var(--error); }
+
+            /* Multi-position styles */
+            .summary-comparison {
+                background: var(--bg-secondary);
+                border-radius: 12px;
+                padding: 1.5rem;
+                border: 1px solid var(--border);
+            }
+
+            .summary-comparison h2 {
+                margin-bottom: 1rem;
+                color: var(--text-primary);
+            }
+
+            .summary-table {
+                width: 100%;
+                border-collapse: collapse;
+            }
+
+            .summary-table th, .summary-table td {
+                padding: 0.75rem;
+                text-align: left;
+                border-bottom: 1px solid var(--border);
+            }
+
+            .summary-table th {
+                background: var(--bg-tertiary);
+                font-weight: 600;
+            }
+
+            .position-section {
+                margin-top: 2.5rem;
+                padding-top: 1.5rem;
+                border-top: 2px solid var(--accent);
+            }
+
+            .position-header {
+                color: var(--accent);
+                margin-bottom: 0.5rem;
+            }
+
+            .position-desc {
+                color: var(--text-secondary);
+                margin-bottom: 1.5rem;
+            }
         </style>
     """
 
@@ -2252,6 +2385,8 @@ def render_probing(selected_model: Optional[str] = None) -> str:
         </p>
 
         {config_html}
+
+        {summary_cards}
 
         {''.join(sections) if sections else '<p>No probing metrics found.</p>'}
 
@@ -2331,6 +2466,113 @@ def generate_probing_csv(selected_model: Optional[str] = None) -> str:
     writer = csv.DictWriter(output, fieldnames=fieldnames)
     writer.writeheader()
     writer.writerows(rows)
+
+    return output.getvalue()
+
+
+def generate_behavioral_probing_csv(selected_model: Optional[str] = None) -> str:
+    """Generate CSV with behavioral probing aggregate data."""
+    dash = get_dashboard(selected_model)
+    bp_results = dash.get_behavioral_probing_results()
+
+    if not bp_results:
+        return ""
+
+    aggregate = bp_results.get("aggregate", {})
+
+    headers = [
+        "task_type", "position",
+        "reality_initial", "reality_final",
+        "protagonist_initial", "protagonist_final",
+        "observer_initial", "observer_final",
+        "fallout_initial", "fallout_final",
+        "protagonist_look_initial", "protagonist_look_final",
+        "observer_look_initial", "observer_look_final",
+        "n"
+    ]
+
+    rows = []
+    for task_type in ["false_belief", "true_belief"]:
+        for pos_data in aggregate.get(task_type, {}).get("by_position", []):
+            rows.append([
+                task_type,
+                pos_data.get("position", 0),
+                pos_data.get("reality_initial", 0),
+                pos_data.get("reality_final", 0),
+                pos_data.get("protagonist_initial", 0),
+                pos_data.get("protagonist_final", 0),
+                pos_data.get("observer_initial", 0),
+                pos_data.get("observer_final", 0),
+                pos_data.get("fallout_initial", 0),
+                pos_data.get("fallout_final", 0),
+                pos_data.get("protagonist_look_initial", 0),
+                pos_data.get("protagonist_look_final", 0),
+                pos_data.get("observer_look_initial", 0),
+                pos_data.get("observer_look_final", 0),
+                pos_data.get("n", 0),
+            ])
+
+    if not rows:
+        return ""
+
+    output = io.StringIO()
+    output.write(",".join(headers) + "\n")
+    for row in rows:
+        output.write(",".join(str(v) for v in row) + "\n")
+
+    return output.getvalue()
+
+
+def generate_behavioral_probing_raw_csv(selected_model: Optional[str] = None) -> str:
+    """Generate CSV with raw per-task behavioral probing data."""
+    dash = get_dashboard(selected_model)
+    bp_results = dash.get_behavioral_probing_results()
+
+    if not bp_results:
+        return ""
+
+    details = bp_results.get("details", [])
+    if not details:
+        return ""
+
+    headers = [
+        "task_id", "family_id", "task_type", "position",
+        "initial_location", "final_location",
+        "reality_p_initial", "reality_p_final",
+        "protagonist_p_initial", "protagonist_p_final",
+        "observer_p_initial", "observer_p_final",
+        "fallout_p_initial", "fallout_p_final",
+        "protagonist_look_p_initial", "protagonist_look_p_final",
+        "observer_look_p_initial", "observer_look_p_final",
+    ]
+
+    output = io.StringIO()
+    output.write(",".join(headers) + "\n")
+
+    for r in details:
+        init_loc = r["initial_location"]
+        final_loc = r["final_location"]
+        row = [
+            r["task_id"],
+            r["family_id"],
+            r["task_type"],
+            r["position"],
+            init_loc,
+            final_loc,
+            r["reality_probs"].get(init_loc, 0),
+            r["reality_probs"].get(final_loc, 0),
+            r["protagonist_probs"].get(init_loc, 0),
+            r["protagonist_probs"].get(final_loc, 0),
+            r["observer_probs"].get(init_loc, 0),
+            r["observer_probs"].get(final_loc, 0),
+            r.get("fallout_probs", {}).get(init_loc, 0),
+            r.get("fallout_probs", {}).get(final_loc, 0),
+            r.get("protagonist_look_probs", {}).get(init_loc, 0),
+            r.get("protagonist_look_probs", {}).get(final_loc, 0),
+            r.get("observer_look_probs", {}).get(init_loc, 0),
+            r.get("observer_look_probs", {}).get(final_loc, 0),
+        ]
+        output.write(",".join(str(v) for v in row) + "\n")
 
     return output.getvalue()
 
@@ -2705,6 +2947,308 @@ def render_attention(selected_model: Optional[str] = None) -> str:
     return render_page("Attention", content, "Attention", selected_model=selected_model)
 
 
+def render_behavioral_probing(selected_model: Optional[str] = None) -> str:
+    """Render behavioral probing analysis page with sentence-by-sentence trajectory plots."""
+    bp_dashboard = get_dashboard(selected_model)
+    bp_results = bp_dashboard.get_behavioral_probing_results()
+
+    if not bp_results:
+        expected_path = "N/A"
+        if selected_model:
+            expected_path = str(Path("results") / selected_model.replace("/", "_") / "behavioral_probing" / "probing_results.json")
+
+        return render_page("Behavioral Probing", f"""
+            <h1>Behavioral Probing</h1>
+            <div class="empty-state">
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+                </svg>
+                <p>No behavioral probing results found.</p>
+                <p>Run <code>python -m src.behavioral_probing --families 50</code> to generate results.</p>
+                <div class="debug-info">
+                    <p><strong>Expected path:</strong> <code>{html_module.escape(expected_path)}</code></p>
+                </div>
+            </div>
+        """, "Beh. Probing", selected_model=selected_model)
+
+    summary = bp_results.get("summary", {})
+    aggregate = bp_results.get("aggregate", {})
+
+    model_name = summary.get("model_name", selected_model or "Unknown")
+    num_families = summary.get("num_families", 0)
+    num_tasks = summary.get("num_tasks", 0)
+    timestamp = summary.get("timestamp", "N/A")
+
+    # Prepare data for the Chart.js plots
+    fb_data = aggregate.get("false_belief", {}).get("by_position", [])
+    tb_data = aggregate.get("true_belief", {}).get("by_position", [])
+
+    # Extract data series for plotting - both P(initial) and P(final) for each probe
+    # False Belief
+    fb_reality_initial = [d.get("reality_initial", 0) for d in fb_data]
+    fb_reality_final = [d.get("reality_final", 0) for d in fb_data]
+    fb_protagonist_initial = [d.get("protagonist_initial", 0) for d in fb_data]
+    fb_protagonist_final = [d.get("protagonist_final", 0) for d in fb_data]
+    fb_observer_initial = [d.get("observer_initial", 0) for d in fb_data]
+    fb_observer_final = [d.get("observer_final", 0) for d in fb_data]
+    fb_fallout_initial = [d.get("fallout_initial", 0) for d in fb_data]
+    fb_fallout_final = [d.get("fallout_final", 0) for d in fb_data]
+    fb_protagonist_look_initial = [d.get("protagonist_look_initial", 0) for d in fb_data]
+    fb_protagonist_look_final = [d.get("protagonist_look_final", 0) for d in fb_data]
+    fb_observer_look_initial = [d.get("observer_look_initial", 0) for d in fb_data]
+    fb_observer_look_final = [d.get("observer_look_final", 0) for d in fb_data]
+
+    # True Belief
+    tb_reality_initial = [d.get("reality_initial", 0) for d in tb_data]
+    tb_reality_final = [d.get("reality_final", 0) for d in tb_data]
+    tb_protagonist_initial = [d.get("protagonist_initial", 0) for d in tb_data]
+    tb_protagonist_final = [d.get("protagonist_final", 0) for d in tb_data]
+    tb_observer_initial = [d.get("observer_initial", 0) for d in tb_data]
+    tb_observer_final = [d.get("observer_final", 0) for d in tb_data]
+    tb_fallout_initial = [d.get("fallout_initial", 0) for d in tb_data]
+    tb_fallout_final = [d.get("fallout_final", 0) for d in tb_data]
+    tb_protagonist_look_initial = [d.get("protagonist_look_initial", 0) for d in tb_data]
+    tb_protagonist_look_final = [d.get("protagonist_look_final", 0) for d in tb_data]
+    tb_observer_look_initial = [d.get("observer_look_initial", 0) for d in tb_data]
+    tb_observer_look_final = [d.get("observer_look_final", 0) for d in tb_data]
+
+    # Sentence labels for x-axis (different for FB vs TB at positions 3-4)
+    fb_labels = [
+        "(before)",
+        "Intro: P, O, init, final",
+        "P puts obj in init",
+        "P leaves",
+        "O moves obj to final",
+        "P returns"
+    ]
+    tb_labels = [
+        "(before)",
+        "Intro: P, O, init, final",
+        "P puts obj in init",
+        "O moves obj to final",
+        "P leaves",
+        "P returns"
+    ]
+
+    content = f"""
+        <h1>Behavioral Probing: Sentence-by-Sentence</h1>
+        <p class="page-description">
+            Tracks how the model's predictions of reality vs. protagonist/observer beliefs evolve
+            as the narrative unfolds sentence by sentence.
+            <a href="https://www.pnas.org/doi/10.1073/pnas.2405460121" target="_blank">Similar to Study 1.4 in Kosinski (2024)</a>.
+        </p>
+
+        <div class="config-panel">
+            <h3>Analysis Configuration</h3>
+            <div class="config-grid">
+                <div class="config-item">
+                    <span class="config-label">Model</span>
+                    <span class="config-value">{html_module.escape(model_name.split('/')[-1] if '/' in model_name else model_name)}</span>
+                </div>
+                <div class="config-item">
+                    <span class="config-label">Families</span>
+                    <span class="config-value">{num_families}</span>
+                </div>
+                <div class="config-item">
+                    <span class="config-label">Tasks</span>
+                    <span class="config-value">{num_tasks}</span>
+                </div>
+                <div class="config-item">
+                    <span class="config-label">Timestamp</span>
+                    <span class="config-value">{html_module.escape(timestamp[:19] if len(timestamp) > 19 else timestamp)}</span>
+                </div>
+            </div>
+            <div style="margin-top: 1rem; display: flex; gap: 1.5rem;">
+                <a href="/behavioral-probing/download/csv{'?model=' + selected_model if selected_model else ''}"
+                   style="color: var(--accent); text-decoration: none; font-size: 0.9rem;">
+                    Download aggregate CSV
+                </a>
+                <a href="/behavioral-probing/download/raw{'?model=' + selected_model if selected_model else ''}"
+                   style="color: var(--accent); text-decoration: none; font-size: 0.9rem;">
+                    Download raw data CSV
+                </a>
+            </div>
+        </div>
+
+        <div class="charts-container" style="display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-top: 2rem;">
+            <!-- Row 1: Reality -->
+            <div class="chart-panel" style="background: var(--bg-secondary); padding: 1rem; border-radius: 8px;">
+                <h4 style="margin-bottom: 0.5rem; color: var(--text-primary);">"The [obj] is in the ___" - False Belief</h4>
+                <canvas id="realityFbChart" width="400" height="250"></canvas>
+            </div>
+            <div class="chart-panel" style="background: var(--bg-secondary); padding: 1rem; border-radius: 8px;">
+                <h4 style="margin-bottom: 0.5rem; color: var(--text-primary);">"The [obj] is in the ___" - True Belief</h4>
+                <canvas id="realityTbChart" width="400" height="250"></canvas>
+            </div>
+
+            <!-- Row 2: Protagonist -->
+            <div class="chart-panel" style="background: var(--bg-secondary); padding: 1rem; border-radius: 8px;">
+                <h4 style="margin-bottom: 0.5rem; color: var(--text-primary);">"[P] thinks the [obj] is in the ___" - False Belief</h4>
+                <canvas id="protagonistFbChart" width="400" height="250"></canvas>
+            </div>
+            <div class="chart-panel" style="background: var(--bg-secondary); padding: 1rem; border-radius: 8px;">
+                <h4 style="margin-bottom: 0.5rem; color: var(--text-primary);">"[P] thinks the [obj] is in the ___" - True Belief</h4>
+                <canvas id="protagonistTbChart" width="400" height="250"></canvas>
+            </div>
+
+            <!-- Row 3: Observer thinks -->
+            <div class="chart-panel" style="background: var(--bg-secondary); padding: 1rem; border-radius: 8px;">
+                <h4 style="margin-bottom: 0.5rem; color: var(--text-primary);">"[O] thinks the [obj] is in the ___" - False Belief</h4>
+                <canvas id="observerFbChart" width="400" height="250"></canvas>
+            </div>
+            <div class="chart-panel" style="background: var(--bg-secondary); padding: 1rem; border-radius: 8px;">
+                <h4 style="margin-bottom: 0.5rem; color: var(--text-primary);">"[O] thinks the [obj] is in the ___" - True Belief</h4>
+                <canvas id="observerTbChart" width="400" height="250"></canvas>
+            </div>
+
+            <!-- Row 4: Fallout -->
+            <div class="chart-panel" style="background: var(--bg-secondary); padding: 1rem; border-radius: 8px;">
+                <h4 style="margin-bottom: 0.5rem; color: var(--text-primary);">"The [obj] falls out of the ___" - False Belief</h4>
+                <canvas id="falloutFbChart" width="400" height="250"></canvas>
+            </div>
+            <div class="chart-panel" style="background: var(--bg-secondary); padding: 1rem; border-radius: 8px;">
+                <h4 style="margin-bottom: 0.5rem; color: var(--text-primary);">"The [obj] falls out of the ___" - True Belief</h4>
+                <canvas id="falloutTbChart" width="400" height="250"></canvas>
+            </div>
+
+            <!-- Row 5: Protagonist will look -->
+            <div class="chart-panel" style="background: var(--bg-secondary); padding: 1rem; border-radius: 8px;">
+                <h4 style="margin-bottom: 0.5rem; color: var(--text-primary);">"[P] will look for the [obj] in the ___" - False Belief</h4>
+                <canvas id="protagonistLookFbChart" width="400" height="250"></canvas>
+            </div>
+            <div class="chart-panel" style="background: var(--bg-secondary); padding: 1rem; border-radius: 8px;">
+                <h4 style="margin-bottom: 0.5rem; color: var(--text-primary);">"[P] will look for the [obj] in the ___" - True Belief</h4>
+                <canvas id="protagonistLookTbChart" width="400" height="250"></canvas>
+            </div>
+
+            <!-- Row 6: Observer will look -->
+            <div class="chart-panel" style="background: var(--bg-secondary); padding: 1rem; border-radius: 8px;">
+                <h4 style="margin-bottom: 0.5rem; color: var(--text-primary);">"[O] will look for the [obj] in the ___" - False Belief</h4>
+                <canvas id="observerLookFbChart" width="400" height="250"></canvas>
+            </div>
+            <div class="chart-panel" style="background: var(--bg-secondary); padding: 1rem; border-radius: 8px;">
+                <h4 style="margin-bottom: 0.5rem; color: var(--text-primary);">"[O] will look for the [obj] in the ___" - True Belief</h4>
+                <canvas id="observerLookTbChart" width="400" height="250"></canvas>
+            </div>
+        </div>
+
+        <div class="explanation-panel" style="background: var(--bg-secondary); padding: 1.5rem; border-radius: 8px; margin-top: 2rem;">
+            <h3>How to Interpret</h3>
+            <p style="color: var(--text-secondary); margin-bottom: 1rem;">
+                Each plot shows P(initial_loc) and P(final_loc) for a specific probe type and task condition.
+            </p>
+            <ul style="color: var(--text-secondary); line-height: 1.8;">
+                <li><strong style="color: #1d9bf0;">P(initial_loc) (blue)</strong>: Probability assigned to where object started</li>
+                <li><strong style="color: #f97316;">P(final_loc) (orange)</strong>: Probability assigned to where object ends up</li>
+            </ul>
+            <p style="color: var(--text-secondary); margin-top: 1rem;">
+                <strong>Key patterns:</strong> In FB, Reality and Observer update at "O moves" while Protagonist stays frozen.
+                In TB, all probes update together at "O moves" (before protagonist leaves).
+            </p>
+        </div>
+
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <script>
+            const fbLabels = {json.dumps(fb_labels)};
+            const tbLabels = {json.dumps(tb_labels)};
+
+            const chartOptions = {{
+                responsive: true,
+                maintainAspectRatio: true,
+                scales: {{
+                    y: {{
+                        beginAtZero: true,
+                        max: 1,
+                        title: {{
+                            display: true,
+                            text: 'Probability',
+                            color: '#8b98a5'
+                        }},
+                        grid: {{
+                            color: 'rgba(139, 152, 165, 0.2)'
+                        }},
+                        ticks: {{
+                            color: '#8b98a5'
+                        }}
+                    }},
+                    x: {{
+                        grid: {{
+                            color: 'rgba(139, 152, 165, 0.2)'
+                        }},
+                        ticks: {{
+                            color: '#8b98a5',
+                            maxRotation: 45,
+                            minRotation: 45,
+                            font: {{ size: 10 }}
+                        }}
+                    }}
+                }},
+                plugins: {{
+                    legend: {{
+                        labels: {{
+                            color: '#e7e9ea'
+                        }}
+                    }}
+                }}
+            }};
+
+            function createChart(canvasId, labels, initialData, finalData) {{
+                new Chart(document.getElementById(canvasId), {{
+                    type: 'line',
+                    data: {{
+                        labels: labels,
+                        datasets: [
+                            {{
+                                label: 'P(initial_loc)',
+                                data: initialData,
+                                borderColor: '#1d9bf0',
+                                backgroundColor: 'rgba(29, 155, 240, 0.1)',
+                                tension: 0.3,
+                                pointRadius: 5
+                            }},
+                            {{
+                                label: 'P(final_loc)',
+                                data: finalData,
+                                borderColor: '#f97316',
+                                backgroundColor: 'rgba(249, 115, 22, 0.1)',
+                                tension: 0.3,
+                                pointRadius: 5
+                            }}
+                        ]
+                    }},
+                    options: chartOptions
+                }});
+            }}
+
+            // Row 1: Reality
+            createChart('realityFbChart', fbLabels, {json.dumps(fb_reality_initial)}, {json.dumps(fb_reality_final)});
+            createChart('realityTbChart', tbLabels, {json.dumps(tb_reality_initial)}, {json.dumps(tb_reality_final)});
+
+            // Row 2: Protagonist thinks
+            createChart('protagonistFbChart', fbLabels, {json.dumps(fb_protagonist_initial)}, {json.dumps(fb_protagonist_final)});
+            createChart('protagonistTbChart', tbLabels, {json.dumps(tb_protagonist_initial)}, {json.dumps(tb_protagonist_final)});
+
+            // Row 3: Observer thinks
+            createChart('observerFbChart', fbLabels, {json.dumps(fb_observer_initial)}, {json.dumps(fb_observer_final)});
+            createChart('observerTbChart', tbLabels, {json.dumps(tb_observer_initial)}, {json.dumps(tb_observer_final)});
+
+            // Row 4: Fallout
+            createChart('falloutFbChart', fbLabels, {json.dumps(fb_fallout_initial)}, {json.dumps(fb_fallout_final)});
+            createChart('falloutTbChart', tbLabels, {json.dumps(tb_fallout_initial)}, {json.dumps(tb_fallout_final)});
+
+            // Row 5: Protagonist will look
+            createChart('protagonistLookFbChart', fbLabels, {json.dumps(fb_protagonist_look_initial)}, {json.dumps(fb_protagonist_look_final)});
+            createChart('protagonistLookTbChart', tbLabels, {json.dumps(tb_protagonist_look_initial)}, {json.dumps(tb_protagonist_look_final)});
+
+            // Row 6: Observer will look
+            createChart('observerLookFbChart', fbLabels, {json.dumps(fb_observer_look_initial)}, {json.dumps(fb_observer_look_final)});
+            createChart('observerLookTbChart', tbLabels, {json.dumps(tb_observer_look_initial)}, {json.dumps(tb_observer_look_final)});
+        </script>
+    """
+
+    return render_page("Behavioral Probing", content, "Beh. Probing", selected_model=selected_model)
+
+
 def render_api_stats(selected_model: Optional[str] = None) -> str:
     """Return JSON stats for API."""
     summary = dashboard.get_study_summary()
@@ -2760,6 +3304,33 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif path == "/attention":
             content = render_attention(selected_model)
             content_type = "text/html"
+        elif path == "/behavioral-probing":
+            content = render_behavioral_probing(selected_model)
+            content_type = "text/html"
+        elif path == "/behavioral-probing/download/csv":
+            csv_content = generate_behavioral_probing_csv(selected_model)
+            if not csv_content:
+                self.send_error(404, "No behavioral probing data available")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv")
+            self.send_header("Content-Disposition", "attachment; filename=behavioral_probing_aggregate.csv")
+            self.send_header("Content-Length", len(csv_content.encode()))
+            self.end_headers()
+            self.wfile.write(csv_content.encode())
+            return
+        elif path == "/behavioral-probing/download/raw":
+            csv_content = generate_behavioral_probing_raw_csv(selected_model)
+            if not csv_content:
+                self.send_error(404, "No behavioral probing data available")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv")
+            self.send_header("Content-Disposition", "attachment; filename=behavioral_probing_raw.csv")
+            self.send_header("Content-Length", len(csv_content.encode()))
+            self.end_headers()
+            self.wfile.write(csv_content.encode())
+            return
         elif path == "/api/stats":
             content = render_api_stats(selected_model)
             content_type = "application/json"
