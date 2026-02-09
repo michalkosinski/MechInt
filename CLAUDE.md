@@ -18,6 +18,9 @@ python -m src.task_generator --families 500 --output tasks.json
 # Test model loading
 python -m src.model_runner --model mistralai/Mistral-7B-v0.3
 
+# Test inference caching (RUN AFTER ANY CHANGES TO model_runner.py)
+python tests/test_cache.py
+
 # Start dashboard (port 8016)
 nohup python server_watchdog.py > /tmp/MechInt_watchdog.log 2>&1 &
 

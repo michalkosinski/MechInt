@@ -5,6 +5,8 @@ Loads models with output_attentions=True and extracts attention weights
 for analysis of Theory of Mind processing.
 
 All model calls go through _call_model() which handles caching automatically.
+
+IMPORTANT: After modifying caching logic, run: python tests/test_cache.py
 """
 
 import atexit
